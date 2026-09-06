@@ -11,22 +11,79 @@
 
     <name>spreader</name>
     <description>
-        Lightweight clustering on the Gossip/SWIM protocol, with zero runtime
-        dependencies.
+        Decentralized clustering for Java on the Gossip/SWIM protocol: instances form
+        a cluster in seconds, elect a leader, keep a live view of every member, and
+        multicast or unicast messages to one another.
 
-        Nodes discover each other, gossip membership, detect failures and elect a
-        leader on their own - no ZooKeeper, no etcd, no external coordinator.
-        Leadership needs no consensus round either: whoever seizes the cluster port
-        is the leader, and the operating system already guarantees that only one
-        process can hold it.
+        Every node runs the same code and holds the same complete member list.
+        Membership spreads by SWIM gossip, point to point between randomly chosen
+        peers and never through a coordinator, so no node exists whose loss stops the
+        rest. A node that dies is found by direct probe, then by indirect probe
+        through other members, then by a suspect timeout. There is no ZooKeeper, no
+        etcd and no external coordinator anywhere in the picture.
 
-        Transports are pluggable - the built-in NIO one, or Netty, MINA and Grizzly
-        - over either TCP or UDP. All four speak the same wire format, so nodes
-        running different implementations can share one cluster.
+        Leadership needs no consensus round: whoever seizes the cluster port is the
+        leader, and the operating system already guarantees that only one process can
+        hold a port. That is what keeps the library this small, and the limit it
+        implies is stated rather than hidden: this is not Raft, so under a network
+        partition two sides can each hold a leader. Recovery is sub-second and every
+        occurrence is counted.
 
-        Ships with per-channel observability out of the box: throughput, concurrency,
-        latency percentiles, error rates and buffer watermarks.
+        Messaging comes with membership: multicast, multicast to one application,
+        unicast, unicast routed by consistent hash on a key, and send-to-leader, with
+        round-robin, random and weighted balancing choosable per call. Independent
+        named channels keep a busy topic from stalling a quiet one, and every dispatch
+        queue is bounded, with whatever it drops counted rather than lost silently.
+
+        Transports are pluggable: the built-in NIO one, or Netty, MINA and Grizzly,
+        over either TCP or UDP. All four speak the same wire format, so nodes running
+        different implementations can share one cluster.
+
+        Per-channel observability is built in: throughput, concurrency, latency
+        percentiles, error rates, buffer watermarks and a split-brain counter.
+
+        Measured on the built-in transport over TCP: 18,464 cross-node
+        request/response round trips per second, and 5.3 million in-process
+        dispatches per second.
     </description>
+    <url>https://github.com/chaconne-ai/spreader</url>
+    <inceptionYear>2026</inceptionYear>
+
+    <organization>
+        <name>ChaconneAI</name>
+        <url>https://github.com/chaconne-ai</url>
+    </organization>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>fredfeng</id>
+            <name>Fred Feng</name>
+            <email>paganini.fy@gmail.com</email>
+            <organization>ChaconneAI</organization>
+            <organizationUrl>https://github.com/chaconne-ai</organizationUrl>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:https://github.com/chaconne-ai/spreader.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/chaconne-ai/spreader.git
+        </developerConnection>
+        <url>https://github.com/chaconne-ai/spreader</url>
+        <tag>HEAD</tag>
+    </scm>
+
+    <issueManagement>
+        <system>GitHub Issues</system>
+        <url>https://github.com/chaconne-ai/spreader/issues</url>
+    </issueManagement>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
@@ -156,6 +213,36 @@
                         </goals>
                     </execution>
                 </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-gpg-plugin</artifactId>
+                <version>3.2.8</version>
+
+                <executions>
+                    <execution>
+                        <id>sign-artifacts</id>
+                        <phase>verify</phase>
+
+                        <goals>
+                            <goal>sign</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <version>0.9.0</version>
+
+                <extensions>true</extensions>
+
+                <configuration>
+                    <publishingServerId>central</publishingServerId>
+                    <autoPublish>true</autoPublish>
+                </configuration>
             </plugin>
         </plugins>
     </build>

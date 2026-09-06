@@ -4,8 +4,23 @@
 [![Java](https://img.shields.io/badge/Java-17%2B-orange.svg)](https://openjdk.org/)
 [![Maven Central](https://img.shields.io/badge/maven--central-1.0.0--SNAPSHOT-blue.svg)](https://central.sonatype.com/)
 
-Clustering for ordinary Java processes. Nodes find each other, notice when one
-dies, and agree on a leader — with **zero runtime dependencies**.
+**Decentralized clustering for Java: instances form a cluster in seconds, elect
+a leader, keep a live view of every member, and multicast or unicast messages to
+one another.**
+
+Every node runs the same code and holds the same complete member list.
+Membership spreads by SWIM gossip, point to point between randomly chosen peers
+and never through a coordinator, so no node exists whose loss stops the rest. A
+node that dies is found by direct probe, then by indirect probe through other
+members, then by a suspect timeout. Leadership is decided by seizing the cluster
+port: the operating system already guarantees that only one process can hold a
+port, so there is no election round, no term and no quorum.
+
+Messaging travels the same channel as membership. Broadcast to the whole
+cluster, to the instances of one application, to a single node, or routed by
+consistent hash on a key. Measured on the built-in transport over TCP: 18,464
+cross-node request/response round trips per second, and 5.3 million in-process
+dispatches per second.
 
 ```java
 GossipCluster cluster = GossipCluster.create(
@@ -17,38 +32,38 @@ if (cluster.isLeader()) {
 }
 ```
 
-## Installation
-
-**Maven**
-
-```xml
-<dependency>
-    <groupId>com.chaconne-ai</groupId>
-    <artifactId>spreader</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
-</dependency>
-```
-
-**Gradle**
-
-```groovy
-implementation 'com.chaconne-ai:spreader:1.0.0-SNAPSHOT'
-```
-
-### Requirements
+## What you get
 
 | | |
 |---|---|
-| **Java** | 17 or later |
-| **Runtime dependencies** | `slf4j-api` only — a logging facade that pulls in nothing itself |
-| **Optional** | Netty, MINA or Grizzly, if you want one of them instead of the built-in NIO transport |
-| **Ports** | one cluster port, identical on every node (22000 by default), plus one work port per node (chosen automatically) |
+| **Cluster formation** | A list of addresses, or an address range, is the whole configuration. A node scans it on startup and either joins whoever answers on the cluster port or becomes the first member. Give it a range and new machines need no config change at all. |
+| **Leader election** | Whoever seizes the cluster port is the leader. No consensus round, no term, no quorum, no replicated log. Takeover follows a fixed order, so the death of a leader promotes a successor that every node already agrees on. |
+| **Member awareness** | SWIM gossip between randomly chosen peers. Every node holds a complete member list and any two views converge. Join, leave, leader change and node death all arrive as callbacks. |
+| **Failure detection** | Direct probe, then indirect probe through other members, then a suspect timeout, with tombstones so a node that died does not come back as a rumour. |
+| **Decentralized throughout** | No coordinator, no registry, no external state, and no node the others depend on. Every node runs identical code, and killing any one of them leaves a working cluster behind. |
+| **Multicast and unicast** | To the whole cluster, to the instances of one application, to a single node, or routed by consistent hash on a key. Round-robin, random and weighted balancing as well, choosable per call. Independent named channels keep a busy topic from stalling a quiet one. |
+| **Performance** | 18,464 cross-node round trips per second and 5.3 million in-process dispatches per second, on the built-in NIO transport over TCP. The full matrix, and the conditions behind it, are under [Performance](#performance-and-what-it-tells-you-about-the-design). |
+| **Four transports, one wire format** | The built-in NIO one, or Netty, MINA, Grizzly, over TCP or UDP. Nodes running *different* implementations interoperate in the same cluster, and that is re-checked on every change rather than assumed. |
+| **Bounded and observable** | Every dispatch queue is bounded and whatever it drops is counted. Per-channel throughput, concurrency, latency percentiles, error rates and buffer watermarks are readable at runtime, and the two failures that produce no log line, dropped messages and a second leader, each have a counter. |
+| **Stated limits** | This is not Raft. Under a network partition two sides can each hold a leader. Recovery is sub-second and every occurrence is counted, and [Limits](#limits) says where that is not good enough. |
+
+## Is this the right tool?
+
+| Your situation | |
+|---|---|
+| 3 to 50 instances of a service that need a leader, a member list, or messages between them | **Yes. This is the case it was built for** |
+| You are on Spring Boot and want locks, a cache, cluster scheduling or RPC as well | Use [**openspreader**](../spreader-commons), the starter built on this |
+| "This must never run twice, **ever**": money moves, or a ledger is written | **No. Use Raft.** [Limits](#limits) says exactly why |
+| Hundreds of nodes, or a cluster spanning datacentres | No. The design and the defaults target a small cluster on a reliable LAN |
+| You already operate ZooKeeper or Consul for other reasons | Probably not worth the swap. The operational cost you would save is already being paid |
 
 ## Table of contents
 
+- [What you get](#what-you-get)
+- [Is this the right tool?](#is-this-the-right-tool)
 - [Why](#why)
 - [How it works](#how-it-works)
-- [Features](#features)
+- [Installation](#installation)
 - [Quick start](#quick-start)
   - [Running in containers](#running-in-containers)
 - [Performance](#performance-and-what-it-tells-you-about-the-design)
@@ -63,7 +78,7 @@ implementation 'com.chaconne-ai:spreader:1.0.0-SNAPSHOT'
 
 ## Why
 
-You have three instances of a service. You need one of them — and only one — to
+You have three instances of a service. You need one of them, and only one, to
 run the nightly job. Or you need instance A to tell instances B and C that a
 cache entry went stale.
 
@@ -79,7 +94,7 @@ themselves.** No coordinator, no registry, no external state.
 Two mechanisms, both deliberately boring.
 
 **Membership is SWIM gossip.** Every second each node picks a few peers at
-random and exchanges member lists directly — point to point, never through a
+random and exchanges member lists directly, point to point, never through a
 leader. Failures are detected by direct probe, then indirect probe through
 other members, then a suspect timeout. Every node holds a complete member list
 and any two views converge.
@@ -105,26 +120,37 @@ release the port and join. Recovery is typically well under a second, and every
 occurrence is counted in `splitBrainOccurrences` so it is never silent.
 
 **If you need a leader that is correct under network partition, use Raft.**
-spreader trades that guarantee for staying small: its only required dependency
-is `slf4j-api`, a logging facade that pulls in nothing itself. For "run this job
+spreader trades that guarantee for having nothing to operate. For "run this job
 on one instance" it is the right trade. For "this must never run twice, ever" it
 is not.
 
-## Features
+## Installation
+
+**Maven**
+
+```xml
+<dependency>
+    <groupId>com.chaconne-ai</groupId>
+    <artifactId>spreader</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+**Gradle**
+
+```groovy
+implementation 'com.chaconne-ai:spreader:1.0.0-SNAPSHOT'
+```
+
+### Requirements
 
 | | |
 |---|---|
-| **Membership** | SWIM gossip, complete member list on every node, eventually consistent |
-| **Failure detection** | direct probe → indirect probe → suspect → dead, with tombstones |
-| **Leader** | port seizure, no consensus round; automatic takeover in a fixed order |
-| **Messaging** | multicast and unicast over the same channel, targeted by application name |
-| **Load balancing** | round-robin, random, weighted, consistent-hash (pick by key) |
-| **Channels** | independent named channels; one slow consumer cannot stall another |
-| **Transports** | built-in NIO, or Netty / MINA / Grizzly — over TCP or UDP |
-| **Observability** | per-channel throughput, latency percentiles, error rates, buffer watermarks |
+| **Java** | 17 or later |
+| **Runtime dependencies** | `slf4j-api` only, a logging facade that pulls in nothing itself |
+| **Optional** | Netty, MINA or Grizzly, if you want one of them instead of the built-in NIO transport |
+| **Ports** | one cluster port, identical on every node (22000 by default), plus one work port per node (chosen automatically) |
 
-All four transport implementations speak the same wire format, so nodes running
-different implementations interoperate in one cluster.
 
 ## Quick start
 
@@ -132,7 +158,7 @@ different implementations interoperate in one cluster.
 GossipCluster cluster = GossipCluster.create(GossipConfig.builder()
         .clusterName("order-cluster")
         .clusterPort(22000)
-        // Where to look for the cluster. Hosts only — the port is the cluster port.
+        // Where to look for the cluster. Hosts only; the port is the cluster port.
         .ipAddresses("192.168.0.111", "192.168.0.63")
         // Or a range, so new machines need no config change
         .ipAddressRange("192.168.0.1-192.168.5.254")
@@ -195,7 +221,7 @@ networks:
 ```
 
 Fixed IPs rather than service names, deliberately. Docker's DNS resolves service
-names and would mask a wrong `advertise-host` — which is precisely the failure
+names and would mask a wrong `advertise-host`, which is precisely the failure
 you want your staging environment to surface, not hide.
 
 Expect a **brief split brain** when containers start together: each host binds
@@ -210,7 +236,7 @@ that is worth knowing before you build on it.
 
 Measured on a single machine over loopback: 8 threads × 2000 synchronous round
 trips, ~300 byte payloads. **Absolute values will not transfer to your
-hardware** — every cross-node call costs a loopback hop instead of a real
+hardware**: every cross-node call costs a loopback hop instead of a real
 network one. The ratios will.
 
 ### Transport × protocol: the pairing is the unit of choice
@@ -229,7 +255,7 @@ inside a 4-core container:
 | GRIZZLY / UDP | 8,751 | 0.910 ms | 0.644 ms | 6.96 ms | 20.2 ms |
 | NETTY / TCP | 7,081 | 1.115 ms | 0.495 ms | 14.46 ms | 56.8 ms |
 
-The built-in NIO transport on TCP leads on every measure at once — throughput,
+The built-in NIO transport on TCP leads on every measure at once: throughput,
 median, tail. That combination is the default for a reason.
 
 **Pick the cell, not the framework.** Netty is second-best on UDP and *last* on
@@ -241,7 +267,7 @@ A word on reading these numbers honestly: an earlier single run on a 12-core
 host put Netty/UDP on top at 14,753 QPS, and NIO/TCP measured 16,351 and 14,637
 in two consecutive runs. Rankings that swing with the host and the run are not
 rankings. **Treat anything under ~20% as noise and benchmark the exact cell you
-intend to deploy** — that is the only number that will hold.
+intend to deploy**. That is the only number that will hold.
 
 ### Dispatch: more threads is not more throughput
 
@@ -254,7 +280,7 @@ intend to deploy** — that is the only number that will hold.
 Rows two and three share a single producer, and **the serial dispatcher wins by
 almost 50%**. Coordination between dispatch threads costs more than the
 parallelism returns. Only when the producing side is concurrent too (row one)
-does the multi-threaded path pull ahead — and then only barely.
+does the multi-threaded path pull ahead, and then only barely.
 
 The practical rule: `payload-dispatch-threads` is not a throughput dial. Raise
 it when several threads publish concurrently, leave it at 1 otherwise.
@@ -269,7 +295,7 @@ a ~20% gap in pure encode/decode. Optimising serialisation is rarely where the
 win is.
 
 **ACK is the throughput knob that matters.** Turning `payload-ack` off moves
-unicast from ~1,900 to ~20,600 msg/s — an 11× difference, because the
+unicast from ~1,900 to ~20,600 msg/s, an 11× difference, because the
 acknowledgement round trip dominates small-message cost. That is the setting to
 reach for, not thread counts.
 
@@ -305,8 +331,8 @@ direct-buffers=false         # off-heap I/O buffers; off by default
 
 TCP with the built-in NIO transport is the default for a reason: first-tier
 throughput, the lowest worst-case latency in the matrix, and nothing to add to
-your dependency tree. Switch to `NETTY` **only** if you also switch to UDP —
-that is the pairing where it wins.
+your dependency tree. Switch to `NETTY` **only** if you also switch to UDP.
+That is the pairing where it wins.
 
 UDP is worth it when you have many nodes and mostly one-way traffic: no
 handshake, no connection state, no TIME_WAIT. It costs you delivery guarantees,
@@ -314,7 +340,7 @@ which is why `payload-ack` exists.
 
 `direct-buffers` switches I/O buffers off-heap. It stays off by default because
 the public API hands you `byte[]`: whatever the off-heap path saves on the way
-in, it pays back copying to the heap on the way out — and for small messages
+in, it pays back copying to the heap on the way out, and for small messages
 off-heap allocation costs more than heap allocation to begin with. It is worth
 measuring when your messages are large and frequent. Set
 `-XX:MaxDirectMemorySize` if you enable it; off-heap memory is outside the heap
@@ -329,7 +355,7 @@ payload-dedup-ttl-ms=60000   # must outlive the whole retry window
 ```
 
 `payload-ack=false` switches to a one-way message type that the peer never
-answers. Roughly **3× the throughput** — the ACK round trip dominates
+answers. Roughly **3× the throughput**, because the ACK round trip dominates
 small-message cost. Use it for telemetry and cache invalidations where losing
 one message is survivable. Keep it on for anything a human would notice.
 
@@ -365,13 +391,13 @@ costs little in detection time and saves a lot of chatter.
 connection-pool-enabled=true   # on by default; TCP only
 pool-max-idle-per-host=8
 payload-concurrency=16
-payload-dispatch-threads=4     # only if producers are concurrent — see above
+payload-dispatch-threads=4     # only if producers are concurrent, see above
 ```
 
 The connection pool is what keeps TCP usable at rate. Without it every message
 opens a connection and leaves a TIME_WAIT: measured **111 TIME_WAIT sockets
 after 100 unicasts** with the pool off, **zero** with it on. Its real value is
-sustainability rather than peak throughput — a short benchmark with the pool
+sustainability rather than peak throughput: a short benchmark with the pool
 disabled looks fine right up until the socket table fills.
 
 ## Observability
@@ -386,9 +412,9 @@ SplitBrainStatus split = cluster.splitBrainStatus();
 
 Two numbers deserve alerts, because **neither produces a log line**:
 
-- `BufferMetrics.dropped() > 0` — messages were thrown away under load. Sender
+- `BufferMetrics.dropped() > 0`: messages were thrown away under load. Sender
   does not know, receiver does not know.
-- `SplitBrainStatus.occurrences()` — how many times this node found another
+- `SplitBrainStatus.occurrences()`: how many times this node found another
   cluster-port holder. Non-zero is normal after a simultaneous restart;
   climbing steadily is not.
 
@@ -400,7 +426,7 @@ all of this on `/actuator/prometheus` and a human-readable
 
 Two runnable classes in `com.chaconneai.spreader.example`:
 
-**`BestPractice`** — forming a cluster, step by step. Each method is a working
+**`BestPractice`**: forming a cluster, step by step. Each method is a working
 fragment you can lift:
 
 | Method | Covers |
@@ -416,7 +442,7 @@ fragment you can lift:
 `main()` runs the whole sequence, so you can watch the real shape of a cluster
 coming up.
 
-**`GossipDemo`** — a command-line node. Start several in separate terminals and
+**`GossipDemo`**: a command-line node. Start several in separate terminals and
 watch them find each other, elect a leader, and notice when you kill one:
 
 ```bash
@@ -467,19 +493,19 @@ version 5 knows it missed one, and can ask for a full snapshot instead of
 silently diverging. Gaps are inevitable on UDP; noticing them is what keeps
 replicas honest.
 
-The `openspreader` starter is this pattern applied seven times — distributed
+The `openspreader` starter is this pattern applied seven times: distributed
 lock, semaphore, latch, barrier, replicated cache, task distribution, RPC. If
 you want a worked reference rather than a sketch, read
 `com.chaconneai.openspreader.cache.CacheService`.
 
 ## How this is verified
 
-**In-JVM suite — 642 cases per cell, 16 cells.** Multi-node clusters in one JVM,
+**In-JVM suite: 642 cases per cell, 16 cells.** Multi-node clusters in one JVM,
 run across the full matrix of 4 transport implementations × 2 protocols × 2
 serializations. All four speak the same wire format, and "still interoperates"
 is a claim that has to be re-checked on every change, not assumed.
 
-TCP finishes the same 642 cases about 40% faster than UDP (145s vs 233s) —
+TCP finishes the same 642 cases about 40% faster than UDP (145s vs 233s).
 UDP pays for fragment reassembly and idempotent de-duplication that TCP hands
 to the kernel.
 
@@ -490,7 +516,7 @@ misconfigured `advertise-host`, and that misconfiguration is the single most
 common way a containerised cluster fails to form.
 
 This layer earned its place. Leadership rests on holding the cluster port, and
-on one machine that *is* mutual exclusion — the kernel refuses the second bind.
+on one machine that *is* mutual exclusion: the kernel refuses the second bind.
 Across machines each host binds its own 22000 with no conflict at all, and the
 discovery path had quietly inherited the single-machine assumption: a node
 holding the port concluded it was the leader and stopped looking for others.
@@ -499,7 +525,7 @@ that never merged. Every in-JVM test passed throughout.
 
 The fix makes an isolated node keep scanning even while holding the port, and
 yield to whoever ranks first. Recovery now happens faster than a 0.5s sampling
-loop can catch — visible only in the `splitBrainOccurrences` counter, which is
+loop can catch, visible only in the `splitBrainOccurrences` counter, which is
 exactly why that counter exists.
 
 ## Limits
@@ -537,7 +563,10 @@ want the cluster and nothing else.
 
 ## Contributing
 
-Issues and pull requests are welcome.
+Issues and pull requests are welcome at
+[github.com/chaconne-ai/spreader](https://github.com/chaconne-ai/spreader).
+For anything that does not belong in a public issue, write to
+hello@chaconne-ai.com.
 
 A few things worth knowing before you open one:
 
@@ -550,16 +579,17 @@ A few things worth knowing before you open one:
 - **Comments are written in English**, and they explain *why* rather than
   restating *what*. The reasoning behind a non-obvious decision is the part
   worth writing down.
-- **Nothing may be added to the runtime dependencies.** Zero dependencies is a
+- **Nothing may be added to the runtime dependencies.** `slf4j-api` alone is a
   design constraint, not an accident. An optional dependency, guarded so the
   library works without it, is a different matter.
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
+Copyright 2026 [ChaconneAI](https://github.com/chaconne-ai).
 
 ```
-Copyright 2026 Fred Feng
+Copyright 2026 ChaconneAI
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------
+target/
+build/
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+# Maven wrapper: the scripts are committed, the downloaded jar is not
+.mvn/wrapper/maven-wrapper.jar
+HELP.md
+
+# ---------------------------------------------------------------
+# IDEs
+# ---------------------------------------------------------------
+# IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Eclipse / Spring Tool Suite
+.apt_generated/
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache/
+
+# NetBeans
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+# VS Code
+.vscode/
+
+# ---------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------
+# Local tooling and logs
+# ---------------------------------------------------------------
+# Per-machine Claude Code settings; the shared .claude/settings.json is committed
+.claude/settings.local.json
+
+*.log
+logs/
+hs_err_pid*.log
+replay_pid*.log
+
+# ---------------------------------------------------------------
+# Working notes kept locally for recall, not part of the repository
+# ---------------------------------------------------------------
+change_logs/
+
+# Other
+.claude

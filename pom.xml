@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.chaconne-ai</groupId>
+    <artifactId>spreader</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>spreader</name>
+    <description>
+        Lightweight clustering on the Gossip/SWIM protocol, with zero runtime
+        dependencies.
+
+        Nodes discover each other, gossip membership, detect failures and elect a
+        leader on their own - no ZooKeeper, no etcd, no external coordinator.
+        Leadership needs no consensus round either: whoever seizes the cluster port
+        is the leader, and the operating system already guarantees that only one
+        process can hold it.
+
+        Transports are pluggable - the built-in NIO one, or Netty, MINA and Grizzly
+        - over either TCP or UDP. All four speak the same wire format, so nodes
+        running different implementations can share one cluster.
+
+        Ships with per-channel observability out of the box: throughput, concurrency,
+        latency percentiles, error rates and buffer watermarks.
+    </description>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- Matches the version Spring Boot 4.1.0 manages, so spreader-commons
+             and this module never disagree on it. -->
+        <slf4j.version>2.0.18</slf4j.version>
+    </properties>
+
+    <dependencies>
+        <!--
+          The only non-optional dependency. slf4j-api is a facade, not an
+          implementation: it pulls in nothing itself and binds to whatever the
+          application already uses (Logback under Spring Boot, JUL, Log4j2...).
+          With no binding on the classpath it degrades to a no-op plus one
+          warning, so it never dictates how a downstream project logs.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!--
+          The transports below are all optional, so nothing is forced on downstream
+          projects: with none of them the built-in NIO transport is used. Add one and
+          set spring.spreader.advanced.transport-provider to switch. Configuring a
+          provider whose library is missing falls back to NIO with a warning instead
+          of failing.
+        -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.101.Final</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.mina</groupId>
+            <artifactId>mina-core</artifactId>
+            <version>2.2.4</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.glassfish.grizzly</groupId>
+            <artifactId>grizzly-framework</artifactId>
+            <version>2.3.35</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Faster MPSC queue for inbound buffers. Affects throughput only,
+             never correctness: without it a built-in ring buffer is used. -->
+        <dependency>
+            <groupId>org.jctools</groupId>
+            <artifactId>jctools-core</artifactId>
+            <version>4.0.5</version>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>17</release>
+                    <compilerArgs>
+                        <arg>-Xlint:all,-serial</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <addDefaultImplementationEntries>true</addDefaultImplementationEntries>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              Javadoc jar for publishing. doclint is off: the docs here are written
+              for people reading the source, and blocking a release over a missing
+              @param tag helps nobody.
+
+              Optional dependencies (Netty, MINA, Grizzly, JCTools) are on the
+              javadoc classpath, so links into them resolve instead of erroring.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+                <version>3.11.2</version>
+                <configuration>
+                    <doclint>none</doclint>
+                    <quiet>true</quiet>
+                    <encoding>UTF-8</encoding>
+                    <charset>UTF-8</charset>
+                    <docencoding>UTF-8</docencoding>
+                    <failOnError>false</failOnError>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>attach-javadocs</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

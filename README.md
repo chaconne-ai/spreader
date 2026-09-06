@@ -52,7 +52,7 @@ if (cluster.isLeader()) {
 | Your situation | |
 |---|---|
 | 3 to 50 instances of a service that need a leader, a member list, or messages between them | **Yes. This is the case it was built for** |
-| You are on Spring Boot and want locks, a cache, cluster scheduling or RPC as well | Use [**openspreader**](../spreader-commons), the starter built on this |
+| You are on Spring Boot and want locks, a cache, cluster scheduling or RPC as well | Use [**openspreader**](https://github.com/chaconne-ai/openspreader), the starter built on this |
 | "This must never run twice, **ever**": money moves, or a ledger is written | **No. Use Raft.** [Limits](#limits) says exactly why |
 | Hundreds of nodes, or a cluster spanning datacentres | No. The design and the defaults target a small cluster on a reliable LAN |
 | You already operate ZooKeeper or Consul for other reasons | Probably not worth the swap. The operational cost you would save is already being paid |
@@ -126,6 +126,10 @@ is not.
 
 ## Installation
 
+> **This is a snapshot release.** Snapshots do not live in the Maven Central
+> release repository, so the repository below has to be declared as well or the
+> dependency will not resolve.
+
 **Maven**
 
 ```xml
@@ -136,10 +140,28 @@ is not.
 </dependency>
 ```
 
+```xml
+<repositories>
+    <repository>
+        <id>central-snapshots</id>
+        <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+        <releases><enabled>false</enabled></releases>
+        <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+</repositories>
+```
+
 **Gradle**
 
 ```groovy
 implementation 'com.chaconne-ai:spreader:1.0.0-SNAPSHOT'
+```
+
+```groovy
+repositories {
+    mavenCentral()
+    maven { url 'https://central.sonatype.com/repository/maven-snapshots/' }
+}
 ```
 
 ### Requirements
@@ -418,7 +440,7 @@ Two numbers deserve alerts, because **neither produces a log line**:
   cluster-port holder. Non-zero is normal after a simultaneous restart;
   climbing steadily is not.
 
-If you use Spring Boot, the [`openspreader`](../spreader-commons) starter exposes
+If you use Spring Boot, the [`openspreader`](https://github.com/chaconne-ai/openspreader) starter exposes
 all of this on `/actuator/prometheus` and a human-readable
 `/actuator/spreader-report`.
 
@@ -545,7 +567,7 @@ Worth knowing before you adopt it:
 ## Spring Boot integration
 
 If you are on Spring Boot, you almost certainly want
-[**openspreader**](../spreader-commons) instead of using this library directly.
+[**openspreader**](https://github.com/chaconne-ai/openspreader) instead of using this library directly.
 It auto-configures the cluster from `application.properties` and adds
 distributed locks, semaphores, latches, barriers, scheduled-task exclusion,
 a cluster cache, RPC and MapReduce on top of it.

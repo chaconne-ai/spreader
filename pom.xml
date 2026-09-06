@@ -220,6 +220,20 @@
                 <artifactId>maven-gpg-plugin</artifactId>
                 <version>3.2.8</version>
 
+                <!--
+                  Loopback pinentry. The plugin runs gpg in batch mode, and with no
+                  graphical pinentry installed gpg has nowhere to ask for the
+                  passphrase, so it fails with "Inappropriate ioctl for device".
+                  Loopback makes gpg take the passphrase from Maven instead, given
+                  as -Dgpg.passphrase on the command line or set in settings.xml.
+                -->
+                <configuration>
+                    <gpgArguments>
+                        <arg>--pinentry-mode</arg>
+                        <arg>loopback</arg>
+                    </gpgArguments>
+                </configuration>
+
                 <executions>
                     <execution>
                         <id>sign-artifacts</id>
@@ -246,4 +260,20 @@
             </plugin>
         </plugins>
     </build>
+
+    <repositories>
+        <repository>
+            <id>central-portal-snapshots</id>
+            <name>Central Portal Snapshots</name>
+            <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
 </project>

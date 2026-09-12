@@ -27,9 +27,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class NamedThreadFactory implements ThreadFactory {
 
+    private static final AtomicInteger counter = new AtomicInteger();
     private final String prefix;
     private final boolean daemon;
-    private final AtomicInteger counter = new AtomicInteger();
 
     public NamedThreadFactory(String prefix, boolean daemon) {
         this.prefix = prefix;

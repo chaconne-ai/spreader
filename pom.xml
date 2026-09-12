@@ -216,37 +216,6 @@
             </plugin>
 
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-gpg-plugin</artifactId>
-                <version>3.2.8</version>
-
-                <!--
-                  Loopback pinentry. The plugin runs gpg in batch mode, and with no
-                  graphical pinentry installed gpg has nowhere to ask for the
-                  passphrase, so it fails with "Inappropriate ioctl for device".
-                  Loopback makes gpg take the passphrase from Maven instead, given
-                  as -Dgpg.passphrase on the command line or set in settings.xml.
-                -->
-                <configuration>
-                    <gpgArguments>
-                        <arg>--pinentry-mode</arg>
-                        <arg>loopback</arg>
-                    </gpgArguments>
-                </configuration>
-
-                <executions>
-                    <execution>
-                        <id>sign-artifacts</id>
-                        <phase>verify</phase>
-
-                        <goals>
-                            <goal>sign</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-
-            <plugin>
                 <groupId>org.sonatype.central</groupId>
                 <artifactId>central-publishing-maven-plugin</artifactId>
                 <version>0.9.0</version>
@@ -260,6 +229,59 @@
             </plugin>
         </plugins>
     </build>
+
+    <!--
+      Signing lives in a profile, so it runs only when a release is actually being
+      published: mvn deploy -Prelease
+      Why not in the build section: every ordinary build reaches the verify phase
+      (install does, and so does the whole test matrix inside Docker), and signing
+      there means every one of them needs a GPG key present. The container has none.
+
+      The price of this choice, stated plainly: forgetting -Prelease publishes
+      UNSIGNED artifacts. Central rejects an unsigned release, so a real release
+      fails loudly; a SNAPSHOT does not require signatures and would go up quietly.
+      So the rule is simple: releases are always deployed with -Prelease.
+    -->
+    <profiles>
+        <profile>
+            <id>release</id>
+
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.8</version>
+
+                        <!--
+                          Loopback pinentry. The plugin runs gpg in batch mode, and with no
+                          graphical pinentry installed gpg has nowhere to ask for the
+                          passphrase, so it fails with "Inappropriate ioctl for device".
+                          Loopback makes gpg take the passphrase from Maven instead, given
+                          as -Dgpg.passphrase on the command line or set in settings.xml.
+                        -->
+                        <configuration>
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
     <repositories>
         <repository>

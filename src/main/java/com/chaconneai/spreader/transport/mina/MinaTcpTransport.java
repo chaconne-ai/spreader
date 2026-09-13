@@ -205,19 +205,21 @@ public class MinaTcpTransport implements Transport {
 
     @Override
     public void stop() {
-        if (!running.compareAndSet(true, false)) {
-            return;
-        }
-        pool.values().forEach(q -> {
-            Pooled p;
-            while ((p = q.poll()) != null) {
-                p.session.closeNow();
+        synchronized (lifecycle) {
+            if (!running.compareAndSet(true, false)) {
+                return;
             }
-        });
-        pool.clear();
-        disposeAll();
-        workers.shutdownNow();
-        log.info("Gossip MINA TCP transport stopped");
+            pool.values().forEach(q -> {
+                Pooled p;
+                while ((p = q.poll()) != null) {
+                    p.session.closeNow();
+                }
+            });
+            pool.clear();
+            disposeAll();
+            workers.shutdownNow();
+            log.info("Gossip MINA TCP transport stopped");
+        }
     }
 
     private void disposeAll() {
@@ -262,22 +264,39 @@ public class MinaTcpTransport implements Transport {
     // Claiming ports
     // ------------------------------------------------------------------
 
+
+    /**
+     * Serialises claiming a port against shutting the transport down.
+     *
+     * <p>Without it the two interleave: a takeover binds the cluster port at the moment
+     * stop() is draining the listener map, and the socket ends up in nobody's hands. It
+     * cannot be cleaned up afterwards either, since closing a channel needs the very event
+     * loop that stop() has just shut down. So the two are kept apart instead: a bind either
+     * completes before the shutdown, and the shutdown closes it, or it finds the transport
+     * already stopped and never binds at all.
+     *
+     * <p>The cost is a lock on a path taken once per leadership change, which is nothing.
+     */
+    private final Object lifecycle = new Object();
+
     @Override
     public InetSocketAddress open(int port) {
-        if (!running.get()) {
-            return null;
-        }
-        InetSocketAddress existing = listeners.get(port);
-        if (existing != null) {
-            return existing;
-        }
-        try {
-            InetSocketAddress bound = bindListener(port);
-            log.info("Claimed the cluster port {}:{}", bindHost, port);
-            return bound;
-        } catch (IOException e) {
-            log.debug("Cluster port {} is already taken: {}", port, e.toString());
-            return null;
+        synchronized (lifecycle) {
+            if (!running.get()) {
+                return null;
+            }
+            InetSocketAddress existing = listeners.get(port);
+            if (existing != null) {
+                return existing;
+            }
+            try {
+                InetSocketAddress bound = bindListener(port);
+                log.info("Claimed the cluster port {}:{}", bindHost, port);
+                return bound;
+            } catch (IOException e) {
+                log.debug("Cluster port {} is already taken: {}", port, e.toString());
+                return null;
+            }
         }
     }
 

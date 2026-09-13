@@ -183,26 +183,28 @@ public class NioTcpTransport implements Transport {
 
     @Override
     public void stop() {
-        if (!running.compareAndSet(true, false)) {
-            return;
-        }
-        if (selector != null) {
-            selector.wakeup();
-        }
-        if (eventLoop != null) {
-            try {
-                eventLoop.join(2_000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        synchronized (lifecycle) {
+            if (!running.compareAndSet(true, false)) {
+                return;
             }
+            if (selector != null) {
+                selector.wakeup();
+            }
+            if (eventLoop != null) {
+                try {
+                    eventLoop.join(2_000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            closeAllListeners();
+            NioChannelIO.closeQuietly(selector);
+            if (pool != null) {
+                pool.close();
+            }
+            workers.shutdownNow();
+            log.info("Gossip transport stopped");
         }
-        closeAllListeners();
-        NioChannelIO.closeQuietly(selector);
-        if (pool != null) {
-            pool.close();
-        }
-        workers.shutdownNow();
-        log.info("Gossip transport stopped");
     }
 
     // ------------------------------------------------------------------
@@ -214,25 +216,42 @@ public class NioTcpTransport implements Transport {
      * on one machine the operating system's port exclusion guarantees a single winner,
      * and across machines the guarantee comes from the caller looking before claiming.
      */
+
+    /**
+     * Serialises claiming a port against shutting the transport down.
+     *
+     * <p>Without it the two interleave: a takeover binds the cluster port at the moment
+     * stop() is draining the listener map, and the socket ends up in nobody's hands. It
+     * cannot be cleaned up afterwards either, since closing a channel needs the very event
+     * loop that stop() has just shut down. So the two are kept apart instead: a bind either
+     * completes before the shutdown, and the shutdown closes it, or it finds the transport
+     * already stopped and never binds at all.
+     *
+     * <p>The cost is a lock on a path taken once per leadership change, which is nothing.
+     */
+    private final Object lifecycle = new Object();
+
     @Override
     public InetSocketAddress open(int port) {
-        if (!running.get()) {
-            return null;
-        }
-        ServerSocketChannel existing = listeners.get(port);
-        if (existing != null) {
-            // Already held -- possibly it is the work port itself. Idempotent return
-            return (InetSocketAddress) quietLocalAddress(existing);
-        }
-        try {
-            ServerSocketChannel ch = bindListener(port);
-            selector.wakeup();
-            log.info("Claimed the cluster port {}:{}", bindHost, port);
-            return (InetSocketAddress) quietLocalAddress(ch);
-        } catch (IOException e) {
-            // Someone else holding the port is the normal outcome of the race, not an error
-            log.debug("Cluster port {} is already taken: {}", port, e.toString());
-            return null;
+        synchronized (lifecycle) {
+            if (!running.get()) {
+                return null;
+            }
+            ServerSocketChannel existing = listeners.get(port);
+            if (existing != null) {
+                // Already held -- possibly it is the work port itself. Idempotent return
+                return (InetSocketAddress) quietLocalAddress(existing);
+            }
+            try {
+                ServerSocketChannel ch = bindListener(port);
+                selector.wakeup();
+                log.info("Claimed the cluster port {}:{}", bindHost, port);
+                return (InetSocketAddress) quietLocalAddress(ch);
+            } catch (IOException e) {
+                // Someone else holding the port is the normal outcome of the race, not an error
+                log.debug("Cluster port {} is already taken: {}", port, e.toString());
+                return null;
+            }
         }
     }
 

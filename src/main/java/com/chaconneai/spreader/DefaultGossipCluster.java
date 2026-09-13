@@ -353,6 +353,17 @@ class DefaultGossipCluster implements GossipCluster {
         if (bound == null) {
             return false;
         }
+        if (stopped.get()) {
+            // This node is on its way out and a takeover that was already in flight has just
+            // claimed the port back. stop() released it a moment ago and will not look again,
+            // so without this the socket outlives the node: the port stays bound, every
+            // survivor's takeover fails with "address already in use", and the cluster is
+            // left with no leader at all. A departing node must not become the leader
+            transport.close(config.clusterPort());
+            log.info("The cluster port was claimed while this node was shutting down, and has "
+                    + "been released again");
+            return false;
+        }
         Node updated = memberList.updateSelfClusterPort(true);
         if (updated != null) {
             checkLeaderChange();

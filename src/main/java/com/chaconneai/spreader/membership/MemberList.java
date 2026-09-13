@@ -481,6 +481,14 @@ public class MemberList {
             if (me.clusterPortHolder() == holding) {
                 return null;
             }
+            if (holding && !me.state().isMember()) {
+                // A node that has already left cannot become the leader. Recording it would
+                // produce a view no one can act on: the holder is not in the member list, so
+                // the leader computes as none while the flag says otherwise
+                log.debug("This node is {} and will not be recorded as holding the cluster port",
+                        me.state());
+                return null;
+            }
             Node updated = me.withClusterPort(holding, me.incarnation() + 1);
             self.set(updated);
             refreshSnapshots();

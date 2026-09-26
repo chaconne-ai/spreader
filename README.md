@@ -343,6 +343,40 @@ ip-addresses=10.0.1.10,10.0.1.11,10.0.1.12
 advertise-host=10.0.1.10
 ```
 
+### Who may become the leader
+
+By default every node contends. When several applications share one cluster name,
+some of them are poor candidates: the leader holds the lock and permit registers
+and the authoritative cache copy, so it wants a long lived, evenly loaded
+instance. An API facade that scales to zero overnight and restarts on every
+deploy will win the port as readily as anything else, and the result is a change
+of leader on every deployment.
+
+```properties
+# This application joins the cluster and does the work, but never contends
+# for leadership. Set per application, not per node.
+leader-eligible=false
+```
+
+A follower only node still joins, still gossips, still receives dispatched work.
+It differs in three places: it never claims the cluster port, it is skipped when
+the others work out whose turn it is to take over, and it advertises the fact
+through member metadata so no node has to guess.
+
+Two consequences are worth knowing before you set it.
+
+The leader also serves as the **rendezvous point** for new nodes. Discovery knocks
+on the cluster port, and the holder of that port is the leader. So a cluster where
+every application sets `leader-eligible=false` has no leader and the members
+cannot discover each other either: each node sits alone with a member list of
+one. This is reported as a periodic warning rather than corrected, because
+electing someone anyway would override an explicit configuration. Starting one
+eligible application fixes both at once, with no restart of the followers needed.
+
+Second, components that need a leader fail rather than degrade while there is
+none. `ProcessingMutex.acquire` returns false; it does not hand out a lock that
+nobody else recognises.
+
 ### Transport
 
 ```properties

@@ -81,6 +81,7 @@ public final class GossipConfig {
     private final int scanTimeoutMs;
     private final int scanConcurrency;
     private final boolean metricsEnabled;
+    private final boolean leaderEligible;
     private final long rediscoverIntervalMs;
     private final long aloneRediscoverIntervalMs;
     private final long leaderQuietPeriodMs;
@@ -152,6 +153,7 @@ public final class GossipConfig {
         this.scanTimeoutMs = b.scanTimeoutMs;
         this.scanConcurrency = b.scanConcurrency;
         this.metricsEnabled = b.metricsEnabled;
+        this.leaderEligible = b.leaderEligible;
         this.rediscoverIntervalMs = b.rediscoverIntervalMs;
         this.aloneRediscoverIntervalMs = b.aloneRediscoverIntervalMs;
         this.leaderQuietPeriodMs = b.leaderQuietPeriodMs;
@@ -480,6 +482,37 @@ public final class GossipConfig {
         return loadBalancer;
     }
 
+    /**
+     * Whether this node may become the leader.
+     *
+     * <p>True unless told otherwise, which is what every node did before this existed.
+     *
+     * <h2>What it is for</h2>
+     * One cluster often holds several applications: the one that does the work, and an API
+     * facade, a batch worker, a console. They share the cluster so that they can see one
+     * another, but <b>they are not equally suited to leading it</b>. The leader keeps the lock
+     * register, the permit register and the cache's authoritative copy, so it wants an
+     * instance that is long-lived, evenly loaded, and deployed in numbers. A facade that is
+     * scaled to zero overnight, or restarted on every release, is a poor choice, and putting
+     * it in the running only means a leadership change each time it is deployed.
+     *
+     * <p>Setting this false says so explicitly: the application joins, sees everyone, uses
+     * every component, and <b>never contends for the cluster port</b>.
+     *
+     * <h2>It changes nothing else</h2>
+     * Not membership, not gossip, not who may call whom, not whether this node's work can be
+     * dispatched to it. A follower-only node is an ordinary member in every respect but one.
+     *
+     * <p><b>Somebody has to be eligible.</b> A cluster where every application sets this false
+     * has no leader at all, and every component that needs one stops working. That is a
+     * configuration mistake rather than a state to recover from, so it is logged as a warning
+     * rather than corrected: correcting it would mean overriding what was explicitly asked
+     * for.
+     */
+    public boolean leaderEligible() {
+        return leaderEligible;
+    }
+
     /** Business metadata; it gossips out to the whole cluster. */
     public Map<String, String> metadata() {
         return metadata;
@@ -507,6 +540,7 @@ public final class GossipConfig {
         private int scanTimeoutMs = 300;
         private int scanConcurrency = 64;
         private boolean metricsEnabled = true;
+        private boolean leaderEligible = true;
         private long rediscoverIntervalMs = 30_000L;
         private long aloneRediscoverIntervalMs = 5_000L;
         private long leaderQuietPeriodMs = 3_000L;
@@ -661,6 +695,18 @@ public final class GossipConfig {
         /** Whether to collect observability data; true by default. */
         public Builder metricsEnabled(boolean enabled) {
             this.metricsEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Whether this node may become the leader. True by default.
+         *
+         * <p>False makes it follower-only: it joins and uses everything, and never contends
+         * for the cluster port. See {@link GossipConfig#leaderEligible()} for when that is
+         * the right thing to say.
+         */
+        public Builder leaderEligible(boolean leaderEligible) {
+            this.leaderEligible = leaderEligible;
             return this;
         }
 

@@ -20,12 +20,17 @@ import com.chaconneai.spreader.GossipConfig;
 import com.chaconneai.spreader.Node;
 import com.chaconneai.spreader.event.GossipListener;
 import com.chaconneai.spreader.loadbalance.LoadBalancer;
+import com.chaconneai.spreader.metrics.BufferMetrics;
+import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.SplitBrainStatus;
 import com.chaconneai.spreader.transport.TransportProvider;
 import com.chaconneai.spreader.transport.TransportType;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -175,9 +180,32 @@ public final class BestPractice {
         return new GossipListener() {
 
             @Override
+            public void onClusterJoined(Node self, boolean alone) {
+                // alone=true means nobody else answered, so this node leads for now. On a
+                // first deployment that is normal; on the fifth node of a running cluster it
+                // means discovery did not reach anyone, which is worth an alert
+                System.out.println("joined: " + (alone
+                        ? "the only node so far, so this one leads"
+                        : "other nodes were found"));
+            }
+
+            @Override
             public void onNodeJoined(Node node) {
                 // Noting it down is enough
                 System.out.println("new peer: " + node.label());
+            }
+
+            @Override
+            public void onNodeSuspect(Node node) {
+                // Suspect and recovered come in pairs during a brief network wobble. Seeing
+                // this pair rather than "left then joined" is how you tell a blip from a
+                // restart
+                System.out.println("suspect: " + node.label());
+            }
+
+            @Override
+            public void onNodeRecovered(Node node) {
+                System.out.println("recovered: " + node.label());
             }
 
             @Override
@@ -197,6 +225,22 @@ public final class BestPractice {
                 // erroring for those few seconds" answerable later
                 System.out.println("leader changed: " + (current == null ? "vacant" : current.label())
                         + (selfIsLeader ? " (this node)" : ""));
+            }
+
+            @Override
+            public void onLeaderLeft(Node node) {
+                // Distinct from onLeaderChanged: this fires the moment the leader is gone,
+                // while a successor has not been settled on yet. Anything that must have a
+                // leader should start refusing or queueing here rather than a few seconds
+                // later, when the failures would otherwise look unexplained
+                System.out.println("leader left: " + node.label() + ", waiting for takeover");
+            }
+
+            @Override
+            public void onLeaderBack(Node node) {
+                // The old leader returned, which means the wobble was in the network rather
+                // than in that process
+                System.out.println("leader back: " + node.label());
             }
 
             @Override
@@ -247,7 +291,120 @@ public final class BestPractice {
     }
 
     // ==================================================================
-    // 5. Advanced configuration: read this once you have the matching problem
+    // 5. Several applications in one cluster: the common case, and its trap
+    // ==================================================================
+
+    /**
+     * One cluster often runs more than one application: the one doing the work, plus an API
+     * facade, a batch job, a console. They share a cluster name so that they can see one
+     * another, and {@code nodeName} is what keeps them apart.
+     *
+     * <p>{@code membersOf} is how you address them. This is the method to reach for, not
+     * {@code members()}: "the other replicas of my own application" is almost always the
+     * question being asked.
+     */
+    public static void severalApplications(GossipCluster cluster) {
+        // My own replicas, which is who shares my work
+        List<Node> myReplicas = cluster.membersOf(cluster.self().name());
+
+        // Another application's instances, for sending it something
+        List<Node> facades = cluster.membersOf("api-facade");
+
+        System.out.println("my replicas: " + myReplicas.size()
+                + ", facade instances: " + facades.size());
+    }
+
+    /**
+     * An application that should join but never lead.
+     *
+     * <p>The leader keeps the lock and permit registers and the authoritative cache copy, so
+     * it wants a long lived, evenly loaded instance. A facade that scales to zero overnight
+     * and restarts on every deploy will take the port just as readily, and what you get is a
+     * change of leader on every deployment. Say so explicitly instead:
+     *
+     * <p>Such a node still joins, still gossips, still receives work. It never claims the
+     * cluster port, and the others skip it when working out whose turn it is to take over.
+     *
+     * <p>One thing to know: setting this on <b>every</b> application means the cluster has no
+     * leader, and since the leader is also where new nodes knock to find the cluster, the
+     * members will not discover each other either. That is a misconfiguration, reported as a
+     * periodic warning rather than corrected.
+     */
+    public static GossipConfig followerOnly() {
+        return GossipConfig.builder()
+                .clusterName("order-cluster")
+                .nodeName("api-facade")
+                .ipAddresses("10.0.0.11", "10.0.0.12")
+                .leaderEligible(false)
+                .build();
+    }
+
+    /**
+     * The trap: <b>do not</b> use {@code isLeader()} to make a scheduled task run once.
+     *
+     * <pre>{@code
+     * // Wrong, where more than one application shares the cluster
+     * if (cluster.isLeader()) {
+     *     syncOrdersDaily();
+     * }
+     * }</pre>
+     *
+     * The leader is a cluster-wide notion that does not distinguish applications. Where an
+     * api-facade instance holds the port, every replica of order-service sees
+     * {@code isLeader() == false}, and the task <b>never runs at all</b>.
+     *
+     * <p>Picking one executor per application is what openspreader's
+     * {@code @MultiProcessingScheduled} does. Use that, or elect within your own application
+     * by comparing against {@code membersOf(self().name())} yourself.
+     */
+    public static void doNotDoThis() {
+    }
+
+    // ==================================================================
+    // 6. What to watch in production
+    // ==================================================================
+
+    /**
+     * Three numbers worth putting on a dashboard, and what each one tells you.
+     *
+     * <p>The two failures that produce no log line each have a counter here. That is the
+     * reason to look at them at all: everything else announces itself.
+     */
+    public static void observability(GossipCluster cluster) {
+        // 1. Split brain: two nodes each believing they lead. Normal operation has one
+        // holder; occurrences counts every time that was not so, including episodes that
+        // healed in under a second and left no trace anywhere else
+        SplitBrainStatus split = cluster.splitBrainStatus();
+        if (!split.healthy()) {
+            System.out.println("split brain: holders=" + split.holders()
+                    + ", for " + split.splittingDurationMillis() + "ms");
+        }
+        System.out.println("split brain episodes so far: " + split.occurrences());
+
+        // 2. Buffers: every inbound queue is bounded, and a full one drops. Sustained usage
+        // above 0.7 is the point to raise the capacity, and any dropped at all means
+        // messages were lost, silently as far as the application is concerned
+        for (BufferMetrics buffer : cluster.bufferMetrics()) {
+            if (buffer.usage() > 0.7 || buffer.hasDropped()) {
+                System.out.println("buffer " + buffer.name() + " usage=" + buffer.usage()
+                        + " dropped=" + buffer.dropped());
+            }
+        }
+
+        // 3. Per channel throughput and latency. Channels are independent, so read them
+        // separately: a busy replication channel says nothing about a quiet one
+        for (ChannelMetrics channel : cluster.metrics().values()) {
+            if (!channel.isIdle()) {
+                System.out.println("channel " + channel.channel()
+                        + " tps=" + channel.tps()
+                        + " errorRate=" + channel.errorRate()
+                        + " inflight=" + channel.inflight());
+            }
+        }
+    }
+
+    // ==================================================================
+    // 7. Advanced configuration: read this once you have the matching problem
     // ==================================================================
 
     /**
@@ -297,7 +454,7 @@ public final class BestPractice {
     }
 
     // ==================================================================
-    // 6. Shutting down: always leave gracefully
+    // 8. Shutting down: always leave gracefully
     // ==================================================================
 
     /**
@@ -317,29 +474,100 @@ public final class BestPractice {
 
     // ==================================================================
 
-    /** Runs the pieces above end to end, to see the real shape of it. */
+    /**
+     * A runnable node, so the pieces above can be watched rather than only read.
+     *
+     * <p>Start several in separate terminals and watch them find each other, elect a leader,
+     * and notice when one is killed:
+     *
+     * <pre>
+     * java -cp spreader-1.0.0-SNAPSHOT.jar com.chaconneai.spreader.example.BestPractice \
+     *      --cluster=order-cluster \
+     *      --port=22000 \
+     *      --ipAddresses=192.168.0.111,192.168.0.63
+     * </pre>
+     *
+     * <p>On one machine add {@code --portRetry=10} and the ports step past each other by
+     * themselves.
+     */
     public static void main(String[] args) throws Exception {
-        GossipConfig config = GossipConfig.builder()
-                .clusterName("best-practice-demo")
-                .nodeName("demo-app")
-                .bindHost("127.0.0.1")
-                .advertiseHost("127.0.0.1")
-                .ipAddresses("127.0.0.1")
-                .build();
+        Args a = Args.parse(args);
 
-        GossipCluster cluster = GossipCluster.create(config);
+        GossipConfig.Builder builder = GossipConfig.builder()
+                .clusterName(a.get("cluster", "demo-cluster"))
+                .nodeName(a.get("app", "demo-app"))
+                .clusterPort(Integer.parseInt(a.get("port", "22000")))
+                .portAutoIncrementRetry(Integer.parseInt(a.get("portRetry", "5")));
+
+        String advertise = a.get("advertiseHost", null);
+        if (advertise != null) {
+            builder.advertiseHost(advertise);
+        }
+        String addresses = a.get("ipAddresses", null);
+        if (addresses != null) {
+            builder.ipAddresses(addresses.split(","));
+        }
+        String range = a.get("ipAddressRange", null);
+        if (range != null) {
+            builder.ipAddressRange(range.split(","));
+        }
+
+        GossipCluster cluster = GossipCluster.create(builder.build());
         cluster.addListener(listener());
         cluster.start();
         shutdownGracefully(cluster);
 
         waitUntilReady(cluster);
         sendingMessages(cluster);
+        severalApplications(cluster);
+        observability(cluster);
 
-        List<Node> members = cluster.members();
-        System.out.println("members now: " + members.stream().map(Node::label).toList());
-        System.out.println("am I the leader: " + cluster.isLeader());
+        // Print the member list periodically, so convergence can actually be watched
+        while (cluster.isRunning()) {
+            printMembers(cluster);
+            TimeUnit.SECONDS.sleep(10);
+        }
+    }
 
-        TimeUnit.SECONDS.sleep(2);
-        cluster.stop();
+    /** The member list as it stands, which is what you want in front of you when debugging. */
+    public static void printMembers(GossipCluster cluster) {
+        Node leader = cluster.leader();
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n===== cluster [").append(cluster.clusterName()).append("] =====\n");
+        sb.append("this node: ").append(cluster.self().label())
+                .append(cluster.isLeader() ? "  [leader]" : "").append('\n');
+        sb.append("leader:    ").append(leader == null ? "vacant" : leader.label()).append('\n');
+        sb.append("members:   ").append(cluster.members().size()).append('\n');
+        for (Node n : cluster.members()) {
+            sb.append("  - ").append(n.label())
+                    .append("  state=").append(n.state())
+                    .append(n.id().equals(cluster.self().id()) ? "  <- me" : "")
+                    .append(leader != null && leader.id().equals(n.id()) ? "  <- leader" : "")
+                    .append('\n');
+        }
+        System.out.println(sb);
+    }
+
+    /** A minimal command-line parser for {@code --key=value}. */
+    record Args(Map<String, String> values) {
+
+        static Args parse(String[] args) {
+            Map<String, String> map = new LinkedHashMap<>();
+            for (String arg : args) {
+                if (!arg.startsWith("--")) {
+                    continue;
+                }
+                int eq = arg.indexOf('=');
+                if (eq > 2) {
+                    map.put(arg.substring(2, eq).trim(), arg.substring(eq + 1).trim());
+                }
+            }
+            return new Args(map);
+        }
+
+        String get(String key, String defaultValue) {
+            String v = values.get(key);
+            return v == null || v.isBlank() ? defaultValue : v;
+        }
     }
 }

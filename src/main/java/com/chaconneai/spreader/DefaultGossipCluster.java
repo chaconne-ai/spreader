@@ -39,6 +39,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -79,6 +80,17 @@ class DefaultGossipCluster implements GossipCluster {
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean stopped = new AtomicBoolean();
     private final CountDownLatch joinLatch = new CountDownLatch(1);
+    /** How long to allow for an ordinary handover before saying anything. */
+    private static final long LEADERLESS_GRACE_MS = 10_000L;
+
+    /** And how often to repeat it afterwards. */
+    private static final long LEADERLESS_WARN_INTERVAL_MS = 30_000L;
+
+    /** When the cluster was first seen without a leader, or 0 while it has one. */
+    private volatile long leaderlessSince;
+
+    private volatile long leaderlessWarnedAt;
+
     private final CountDownLatch leaderLatch = new CountDownLatch(1);
     private final AtomicReference<Node> lastKnownLeader = new AtomicReference<>();
 
@@ -201,7 +213,7 @@ class DefaultGossipCluster implements GossipCluster {
                 NodeState.ALIVE,
                 config.priority(),
                 false,
-                config.metadata());
+                selfMetadata());
 
         this.memberList = new MemberList(self, config.tombstoneTtlMs(), log);
         this.discovery = new NodeDiscovery(config, transport, memberList::self, stopped::get);
@@ -225,10 +237,11 @@ class DefaultGossipCluster implements GossipCluster {
                 new NamedThreadFactory("gossip-payload", true),
                 new ThreadPoolExecutor.CallerRunsPolicy());
 
-        log.info("Node started: cluster={}, name={}, id={}, workPort={}, clusterPort={}, transport={}/{}",
+        log.info("Node started: cluster={}, name={}, id={}, workPort={}, clusterPort={}, transport={}/{}{}",
                 config.clusterName(), self.name(), self.shortId(), self.address(),
                 config.clusterPort(), config.transportType(),
-                transport.getClass().getSimpleName());
+                transport.getClass().getSimpleName(),
+                config.leaderEligible() ? "" : ", follower only (does not contend for leadership)");
         publish(ClusterEventType.SELF_STARTED, self, null, false);
 
         // Discovery runs in the background so the caller is not blocked; scanning a range
@@ -238,6 +251,34 @@ class DefaultGossipCluster implements GossipCluster {
         bootstrap.start();
 
         scheduleTasks();
+    }
+
+    /**
+     * This node's metadata, plus the one thing the others need to know about it.
+     *
+     * <p>A follower-only node advertises the fact, and it goes out through metadata rather
+     * than through a new protocol field: metadata already gossips to everyone, and a wire
+     * change would mean a version of this library that cannot talk to the one before it.
+     *
+     * <p>What the others do with it is skip it when they work out <b>whose turn it is</b> to
+     * take over. Without that, an eligible node sitting behind three follower-only ones waits
+     * out three takeover slots for nothing, and a leaderless cluster stays leaderless for
+     * longer than it needs to.
+     */
+    private Map<String, String> selfMetadata() {
+        if (config.leaderEligible()) {
+            return config.metadata();
+        }
+        Map<String, String> metadata = new LinkedHashMap<>(config.metadata());
+        metadata.put(Node.LEADER_ELIGIBLE, "false");
+        return metadata;
+    }
+
+    /** Whether this member contends for leadership, as far as its metadata says. */
+    private static boolean eligible(Node node) {
+        // Absent means yes: every node before this feature existed says nothing, and every
+        // node that does contend says nothing either
+        return !"false".equals(node.metadata().get(Node.LEADER_ELIGIBLE));
     }
 
     private void bootstrap() {
@@ -333,6 +374,14 @@ class DefaultGossipCluster implements GossipCluster {
             return;
         }
 
+        if (!config.leaderEligible()) {
+            // Follower-only: discovery has run and nobody answered, which means there is no
+            // leader yet. Joining is done; claiming is not this node's job. It will find the
+            // leader on a later round, once an eligible node has taken the port
+            log.debug("Nobody answered, and this node does not contend for leadership");
+            return;
+        }
+
         // Nobody answered: the cluster has no leader yet, so go and claim the port
         if (!takeClusterPort()) {
             // Someone got there first while claiming; knock once more to identify them
@@ -349,6 +398,11 @@ class DefaultGossipCluster implements GossipCluster {
      * @return whether it was won
      */
     private boolean takeClusterPort() {
+        if (!config.leaderEligible()) {
+            // Belt as well as braces. Every caller checks first; this is here so that a
+            // caller added later cannot quietly make a follower-only node the leader
+            return false;
+        }
         InetSocketAddress bound = transport.open(config.clusterPort());
         if (bound == null) {
             return false;
@@ -396,17 +450,23 @@ class DefaultGossipCluster implements GossipCluster {
         if (stopped.get() || transport.holds(config.clusterPort())) {
             return;
         }
+        if (!config.leaderEligible()) {
+            // Not queued at all, rather than queued and refused later: a node that cannot
+            // take over should not occupy a slot in the staggered order, or every eligible
+            // node behind it would wait its turn out for nothing
+            return;
+        }
         if (!takeoverPending.compareAndSet(false, true)) {
             return;
         }
-        long delay = (long) memberList.selfRank() * config.takeoverDelayMs();
+        long delay = (long) eligibleRank() * config.takeoverDelayMs();
         try {
             scheduler.schedule(() -> {
                 takeoverPending.set(false);
                 try {
                     if (!stopped.get() && memberList.leader() == null) {
                         log.info("The cluster port is vacant; this node (rank {} in the takeover order) is attempting it",
-                                memberList.selfRank() + 1);
+                                eligibleRank() + 1);
                         probe();
                     }
                 } catch (Throwable t) {
@@ -416,6 +476,27 @@ class DefaultGossipCluster implements GossipCluster {
         } catch (RuntimeException e) {
             takeoverPending.set(false);
         }
+    }
+
+    /**
+     * This node's place in the takeover order, <b>counting only members that contend</b>.
+     *
+     * <p>{@code MemberList.selfRank()} counts every member, which is the right answer to a
+     * different question. Here the answer decides how long to wait before going for the port,
+     * and waiting behind a node that will never go is waiting for nothing.
+     */
+    private int eligibleRank() {
+        String selfId = memberList.self().id();
+        int rank = 0;
+        for (Node member : memberList.members()) {
+            if (member.id().equals(selfId)) {
+                return rank;
+            }
+            if (eligible(member)) {
+                rank++;
+            }
+        }
+        return rank;
     }
 
     /**
@@ -586,6 +667,13 @@ class DefaultGossipCluster implements GossipCluster {
         scheduler.scheduleWithFixedDelay(this::safeCheckWorkPort,
                 reapInterval, reapInterval, TimeUnit.MILLISECONDS);
 
+        // Leaderless is normally a transient state announced by a transition, and the
+        // transition is what gets logged. A cluster where every application is
+        // follower-only never has that transition: it is born without a leader and stays
+        // that way, silently, until somebody notices the locks never being granted
+        scheduler.scheduleWithFixedDelay(this::safeCheckLeaderless,
+                reapInterval, reapInterval, TimeUnit.MILLISECONDS);
+
         // The split-brain check runs periodically too. Checking only on receiving gossip
         // would freeze "how long has it been split" at the moment of the last message --
         // and what most needs watching about a split is precisely that it is not healing,
@@ -700,6 +788,72 @@ class DefaultGossipCluster implements GossipCluster {
         } catch (Throwable t) {
             log.error("The work-port check task threw", t);
         }
+    }
+
+    /**
+     * Says so, repeatedly, when the cluster has no leader.
+     *
+     * <p>Rate-limited to once every thirty seconds, because the point is to be noticed in a
+     * log that is being read later, not to fill it.
+     *
+     * <p>The message differs by cause, and that is the whole value of it. A cluster that is
+     * leaderless <b>between</b> leaders is doing what it should; a cluster that is leaderless
+     * because nobody is allowed to lead is misconfigured, and the only way anyone finds out is
+     * being told.
+     */
+    private void safeCheckLeaderless() {
+        try {
+            if (stopped.get() || memberList == null || !discoveryCompleted.get()) {
+                return;
+            }
+            if (memberList.leader() != null) {
+                leaderlessSince = 0L;
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (leaderlessSince == 0L) {
+                leaderlessSince = now;
+                return;
+            }
+            if (now - leaderlessSince < LEADERLESS_GRACE_MS
+                    || now - leaderlessWarnedAt < LEADERLESS_WARN_INTERVAL_MS) {
+                return;
+            }
+            leaderlessWarnedAt = now;
+            long seconds = (now - leaderlessSince) / 1000L;
+
+            if (!config.leaderEligible() && noEligibleMember()) {
+                log.warn("No leader for {}s and not one of the {} member(s) this node can see "
+                        + "is allowed to become one: they all have leader-eligible=false. "
+                        + "Note that the leader also serves as the rendezvous point for new "
+                        + "nodes, so without one the members cannot even discover each other: "
+                        + "the real cluster is likely larger than what is visible here. "
+                        + "Locks, permits, latches, barriers and cache replication all need a "
+                        + "leader and will not work until one application is made eligible",
+                        seconds, memberList.size());
+            } else if (!config.leaderEligible()) {
+                log.warn("The cluster has had no leader for {}s. This node does not contend "
+                        + "for leadership, so it is waiting for an eligible one to take the "
+                        + "cluster port; {} member(s) visible", seconds, memberList.size());
+            } else {
+                log.warn("The cluster has had no leader for {}s with {} member(s) visible, "
+                        + "and this node is eligible: the cluster port is being refused. "
+                        + "Check that port {} is reachable and not held by something else",
+                        seconds, memberList.size(), config.clusterPort());
+            }
+        } catch (Throwable t) {
+            log.error("The leaderless check threw", t);
+        }
+    }
+
+    /** Whether nobody in the current view contends for leadership. */
+    private boolean noEligibleMember() {
+        for (Node member : memberList.members()) {
+            if (eligible(member)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

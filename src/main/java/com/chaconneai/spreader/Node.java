@@ -63,6 +63,19 @@ public final class Node implements Comparable<Node> {
     /** The default application name. Nodes with no name configured all fall into this group. */
     public static final String DEFAULT_NAME = "default";
 
+    /**
+     * The metadata key a follower-only node advertises itself with.
+     *
+     * <p>Present and {@code "false"} means this node does not contend for leadership; see
+     * {@code GossipConfig.leaderEligible()}. <b>Absent means it does</b>, which is what every
+     * node says that has never heard of the setting, this library's own older versions
+     * included.
+     *
+     * <p>It travels as metadata rather than as a field of its own, so that a cluster can run
+     * two versions of this library while it is being rolled out.
+     */
+    public static final String LEADER_ELIGIBLE = "spreader.leaderEligible";
+
     public Node(String id, String name, String host, int port, long startTime, long incarnation,
                 NodeState state, int priority, Map<String, String> metadata) {
         this(id, name, host, port, startTime, incarnation, state, priority, false, metadata);

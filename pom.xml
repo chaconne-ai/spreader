@@ -89,19 +89,10 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <!-- Matches the version Spring Boot 4.1.0 manages, so spreader-commons
-             and this module never disagree on it. -->
         <slf4j.version>2.0.18</slf4j.version>
     </properties>
 
     <dependencies>
-        <!--
-          The only non-optional dependency. slf4j-api is a facade, not an
-          implementation: it pulls in nothing itself and binds to whatever the
-          application already uses (Logback under Spring Boot, JUL, Log4j2...).
-          With no binding on the classpath it degrades to a no-op plus one
-          warning, so it never dictates how a downstream project logs.
-        -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>

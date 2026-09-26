@@ -22,17 +22,14 @@ import java.lang.invoke.VarHandle;
  * A long cursor that occupies an entire cache line on its own.
  *
  * <h2>Why the padding</h2>
- * CPU caches read and write in <b>cache lines</b>, typically 64 bytes. Two variables
- * placed next to each other land on the same line, so when one core writes A and
- * another reads B, B's cache line is invalidated as well -- even though nobody touched
- * B. That is <b>false sharing</b>.
+ * CPU caches read and write in <b>cache lines</b>, typically 64 bytes, so two adjacent
+ * variables share one: a write to A invalidates B's line even though nobody touched B. That is
+ * <b>false sharing</b>, and a ring buffer contains exactly such a pair, with producers
+ * hammering the write cursor while the consumer hammers the read cursor. Measured, adjacency
+ * costs more than half the throughput.
  *
- * <p>A ring buffer contains exactly such a pair: the producers hammer the write cursor
- * while the consumer hammers the read cursor. Placed adjacently, two cores fight over
- * one cache line, and measurements show throughput dropping by more than half.
- *
- * <p>Seven longs of padding on each side (56 bytes) plus the 8-byte value fill a cache
- * line exactly, so no matter what the neighbours do, they cannot touch it.
+ * <p>Seven longs of padding on each side (56 bytes) plus the 8-byte value fill a cache line
+ * exactly, so whatever the neighbours do, they cannot touch it.
  *
  * <h2>Why an inheritance chain rather than padding fields in one class</h2>
  * The JVM reorders fields within a class -- grouping by size to reduce gaps -- and the

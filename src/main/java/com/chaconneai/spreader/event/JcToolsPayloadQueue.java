@@ -23,27 +23,11 @@ import java.util.function.Consumer;
 /**
  * An implementation backed by JCTools' {@code MpscArrayQueue}.
  *
- * <h2>Why JCTools rather than hand-rolling it</h2>
- * It follows the same ideas (monotonic sequence, CAS to claim a slot, batched
- * consumption) but works them out in far more detail:
- * <ul>
- *   <li><b>Cache-line padding</b> -- the producer and consumer cursors are forced onto
- *       separate cache lines. Adjacent, a write by one invalidates the other's cache
- *       line (false sharing), and under high concurrency that costs more than the queue
- *       itself</li>
- *   <li><b>Memory barriers pared to the minimum</b> -- every volatile read and write has
- *       been weighed, and lazySet is used wherever a volatile write is not required</li>
- *   <li>It has been run by a great many high-frequency systems. The edge cases in
- *       lock-free structures like this are extremely hard to test exhaustively on
- *       your own</li>
- * </ul>
- *
- * <h2>Why not Disruptor</h2>
- * Disruptor is more powerful, but it asks you to take on the whole
- * {@code EventFactory} / {@code EventHandler} / {@code RingBuffer} API, which is far
- * more invasive -- and its strengths (multi-consumer dependency graphs, pre-allocated
- * objects for zero GC) are of no use here. JCTools' API is simply a {@code Queue}, so
- * adopting it changed only a few lines.
+ * <p>It follows the same ideas as a hand-rolled ring buffer (monotonic sequence, CAS to claim a
+ * slot, batched consumption) but pares the memory barriers to the minimum and forces the
+ * producer and consumer cursors onto separate cache lines. The edge cases in a lock-free
+ * structure like this are very hard to test exhaustively alone, which is the actual reason to
+ * take one that a great many high-frequency systems have already run.
  *
  * <p>{@link PayloadQueues} loads this class reflectively, so when JCTools is absent from
  * the classpath the class is never loaded at all and there is no

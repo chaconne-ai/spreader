@@ -12,9 +12,8 @@ Every node runs the same code and holds the same complete member list.
 Membership spreads by SWIM gossip, point to point between randomly chosen peers
 and never through a coordinator, so no node exists whose loss stops the rest. A
 node that dies is found by direct probe, then by indirect probe through other
-members, then by a suspect timeout. Leadership is decided by seizing the cluster
-port: the operating system already guarantees that only one process can hold a
-port, so there is no election round, no term and no quorum.
+members, then by a suspect timeout. Leadership is pre-emptive: whichever node
+holds the cluster port is the leader.
 
 Messaging travels the same channel as membership. Broadcast to the whole
 cluster, to the instances of one application, to a single node, or routed by
@@ -37,7 +36,7 @@ if (cluster.isLeader()) {
 | | |
 |---|---|
 | **Cluster formation** | A list of addresses, or an address range, is the whole configuration. A node scans it on startup and either joins whoever answers on the cluster port or becomes the first member. Give it a range and new machines need no config change at all. |
-| **Leader election** | Whoever seizes the cluster port is the leader. No consensus round, no term, no quorum, no replicated log. Takeover follows a fixed order, so the death of a leader promotes a successor that every node already agrees on. |
+| **Leader election** | Pre-emptive: whichever node holds the cluster port is the leader. Takeover follows a fixed order, so the death of a leader promotes a successor that every node already agrees on. This is a different route from consensus, not a cheaper one, and [How it works](#how-it-works) sets out what each route gives you. |
 | **Member awareness** | SWIM gossip between randomly chosen peers. Every node holds a complete member list and any two views converge. Join, leave, leader change and node death all arrive as callbacks. |
 | **Failure detection** | Direct probe, then indirect probe through other members, then a suspect timeout, with tombstones so a node that died does not come back as a rumour. |
 | **Decentralized throughout** | No coordinator, no registry, no external state, and no node the others depend on. Every node runs identical code, and killing any one of them leaves a working cluster behind. |
@@ -45,7 +44,7 @@ if (cluster.isLeader()) {
 | **Performance** | 18,464 cross-node round trips per second and 5.3 million in-process dispatches per second, on the built-in NIO transport over TCP. The full matrix, and the conditions behind it, are under [Performance](#performance-and-what-it-tells-you-about-the-design). |
 | **Four transports, one wire format** | The built-in NIO one, or Netty, MINA, Grizzly, over TCP or UDP. Nodes running *different* implementations interoperate in the same cluster, and that is re-checked on every change rather than assumed. |
 | **Bounded and observable** | Every dispatch queue is bounded and whatever it drops is counted. Per-channel throughput, concurrency, latency percentiles, error rates and buffer watermarks are readable at runtime, and the two failures that produce no log line, dropped messages and a second leader, each have a counter. |
-| **Stated limits** | This is not Raft. Under a network partition two sides can each hold a leader. Recovery is sub-second and every occurrence is counted, and [Limits](#limits) says where that is not good enough. |
+| **Stated limits** | Pre-emptive election means that under a network partition two sides can each hold a leader. Recovery is sub-second and every occurrence is counted, and [Limits](#limits) says where that is not good enough. |
 
 ## Is this the right tool?
 
@@ -53,7 +52,7 @@ if (cluster.isLeader()) {
 |---|---|
 | 3 to 50 instances of a service that need a leader, a member list, or messages between them | **Yes. This is the case it was built for** |
 | You are on Spring Boot and want locks, a cache, cluster scheduling or RPC as well | Use [**openspreader**](https://github.com/chaconne-ai/openspreader), the starter built on this |
-| "This must never run twice, **ever**": money moves, or a ledger is written | **No. Use Raft.** [Limits](#limits) says exactly why |
+| "This must never run twice, **ever**": money moves, or a ledger is written | **No.** That needs consensus-based election, so reach for Raft. [Limits](#limits) says exactly why |
 | Hundreds of nodes, or a cluster spanning datacentres | No. The design and the defaults target a small cluster on a reliable LAN |
 | You already operate ZooKeeper or Consul for other reasons | Probably not worth the swap. The operational cost you would save is already being paid |
 
@@ -63,13 +62,17 @@ if (cluster.isLeader()) {
 - [Is this the right tool?](#is-this-the-right-tool)
 - [Why](#why)
 - [How it works](#how-it-works)
+  - [Pre-emptive and consensus-based election are two routes](#pre-emptive-and-consensus-based-election-are-two-routes-not-two-grades)
 - [Installation](#installation)
 - [Quick start](#quick-start)
   - [Running in containers](#running-in-containers)
 - [Performance](#performance-and-what-it-tells-you-about-the-design)
+  - [The same four transports, measured through the components](#the-same-four-transports-measured-through-the-components)
 - [Recommended configuration](#recommended-configuration)
+  - [Who may become the leader](#who-may-become-the-leader)
 - [Observability](#observability)
 - [Examples](#examples)
+  - [Building your own distributed component](#building-your-own-distributed-component)
 - [How this is verified](#how-this-is-verified)
 - [Limits](#limits)
 - [Spring Boot integration](#spring-boot-integration)
@@ -99,30 +102,66 @@ leader. Failures are detected by direct probe, then indirect probe through
 other members, then a suspect timeout. Every node holds a complete member list
 and any two views converge.
 
-**Leadership is a port.** Whoever seizes the cluster port (22000 by default) is
-the leader. The operating system already guarantees that only one process can
-hold a port, so there is no election, no term, no quorum, no consensus round.
-A new node scans the configured addresses, knocks on 22000, and either finds a
-leader or becomes one.
+**Leadership is pre-emptive.** The cluster has one fixed port (22000 by default)
+and whichever node holds it is the leader. A new node scans the configured
+addresses, knocks on that port, and either finds a leader or becomes one.
 
-That second decision is worth being explicit about, because it defines the
-system's limits:
+### Pre-emptive and consensus-based election are two routes, not two grades
 
-- **On one machine it is exact.** The OS refuses the second bind. Period.
+They answer different questions, which is why this is a choice rather than a
+compromise.
+
+**Where the leader's legitimacy comes from** is the root of every other
+difference. Pre-emptive: from holding a physically exclusive resource.
+Consensus-based: from the authorisation of a majority, since two majorities must
+intersect and a node in that intersection will not vote twice in one term.
+Physical exclusion versus set-theoretic exclusion.
+
+| | Pre-emptive (this library) | Consensus-based (Raft) |
+|---|---|---|
+| How a leader arises | whoever takes the port | whoever a majority votes for |
+| Must the leader be up to date? | **No.** A node that just restarted and knows nothing can lead | **Yes.** Candidates with a stale log cannot win |
+| Terms | none | monotonic, and a message from an older term is refused |
+| One node | works | works |
+| Two nodes, one dies | the survivor takes over | **stalls**, no majority |
+| Membership changes | soft state, gossiped, nodes come and go freely | configuration state, changed through the log |
+| Disk | none | `currentTerm` and `votedFor` must be fsynced before voting |
+| Under partition | both sides can have a leader and accept writes | the minority elects nobody and refuses writes |
+| Takeover time | 3 to 4 seconds, dominated by failure detection | typically a few hundred milliseconds |
+
+Two consequences of the second row are worth stating plainly, because they shape
+how this library should be used.
+
+**A pre-emptive leader carries no data authority.** It is not required to be up
+to date, so any state it holds has to be **rebuildable**. That is the premise
+behind keeping registers in the leader's memory rather than replicating them. A
+Raft leader is by construction the one with the fullest log, which is what makes
+it safe to entrust state to.
+
+**With no terms there is no built-in fencing.** Raft refuses a message from an
+older term for free. Here, a leader that has already been replaced can still
+write to an outside resource without knowing it has been replaced. Where that
+matters, carry a monotonic token from the leader into the resource you write and
+have the resource refuse older ones.
+
+### What that means in practice here
+
+- **On one machine the exclusion is exact.** The OS refuses the second bind.
+  Period.
 - **Across machines it is a race.** Every machine can bind *its own* 22000
-  without conflict. Mutual exclusion comes from "scan on startup, plus timing",
-  not from the kernel. Two nodes starting simultaneously **can** both become
-  leader for a moment.
+  without conflict, so mutual exclusion comes from "scan on startup, plus
+  timing" rather than from the kernel. Two nodes starting simultaneously **can**
+  both become leader for a moment.
 
 The brief split brain is expected, not a bug. What matters is that it heals:
-nodes that discover another holder whose takeover order comes first will
-release the port and join. Recovery is typically well under a second, and every
+nodes that discover another holder whose takeover order comes first will release
+the port and join. Recovery is typically well under a second, and every
 occurrence is counted in `splitBrainOccurrences` so it is never silent.
 
-**If you need a leader that is correct under network partition, use Raft.**
-spreader trades that guarantee for having nothing to operate. For "run this job
-on one instance" it is the right trade. For "this must never run twice, ever" it
-is not.
+So the dividing line is the nature of the work, not its importance. Coordination
+where a repeat is wasteful fits this route: "run this job on one instance",
+"warm this cache once", "de-duplicate this batch". Work where a repeat causes
+real harm needs consensus-based election, and Raft is the right tool for it.
 
 ## Installation
 
@@ -169,7 +208,6 @@ repositories {
 | | |
 |---|---|
 | **Java** | 17 or later |
-| **Runtime dependencies** | `slf4j-api` only, a logging facade that pulls in nothing itself |
 | **Optional** | Netty, MINA or Grizzly, if you want one of them instead of the built-in NIO transport |
 | **Ports** | one cluster port, identical on every node (22000 by default), plus one work port per node (chosen automatically) |
 
@@ -291,6 +329,49 @@ in two consecutive runs. Rankings that swing with the host and the run are not
 rankings. **Treat anything under ~20% as noise and benchmark the exact cell you
 intend to deploy**. That is the only number that will hold.
 
+### The same four transports, measured through the components
+
+The table above is a bare request/response round trip. This one is the same four
+transports carrying real coordination work, which is a different path: a lock
+acquisition is a message to the leader plus a reply, a cache write is a message
+to the leader plus a broadcast back. JDK serialization, 4-core container.
+
+**TCP**
+
+| Operation | NIO | NETTY | MINA | GRIZZLY |
+|---|---:|---:|---:|---:|
+| lock acquire + release | **875** | 686 | 616 | 648 |
+| semaphore acquire + release | **806** | 655 | 546 | 654 |
+| cache write (`incr`) | **2,110** | 1,733 | 1,440 | 1,748 |
+| task dispatch to a peer | **11,581** | 10,028 | 11,473 | 9,148 |
+
+**UDP**
+
+| Operation | NIO | NETTY | MINA | GRIZZLY |
+|---|---:|---:|---:|---:|
+| lock acquire + release | 2,878 | 2,162 | **3,009** | 720 |
+| semaphore acquire + release | **3,832** | 1,777 | 1,719 | 709 |
+| cache write (`incr`) | **8,326** | 8,237 | 2,645 | 1,618 |
+| task dispatch to a peer | 5,809 | **10,787** | 10,407 | 8,856 |
+
+Two things stand out, and both change how you choose.
+
+**Coordination runs 3 to 4 times faster over UDP than over TCP.** Locks go from
+875 to 2,878 and cache writes from 2,110 to 8,326. Note that this does not
+contradict the round-trip table above, where TCP led: these operations are short
+one-way messages plus a reply, and TCP's acknowledgement and congestion control
+are pure overhead on that shape. Where the workload is a sustained
+request/response stream instead, TCP wins. Measure the shape you actually run.
+
+**Grizzly collapses on UDP.** 720 QPS against NIO's 2,878 is a four-fold gap,
+far outside the noise band, and it appears on every coordination row while
+leaving task dispatch unaffected. Whatever the cause, the conclusion is the one
+already stated: **pick the cell, not the framework.**
+
+Reads are absent from both tables on purpose. They are served from local memory
+and never touch the transport, so the numbers vary by measurement noise alone and
+comparing them would only mislead.
+
 ### Dispatch: more threads is not more throughput
 
 | Mode | msg/s | per message |
@@ -309,23 +390,19 @@ it when several threads publish concurrently, leave it at 1 otherwise.
 
 ### What these numbers say about the design
 
-Three properties, each visible in the measurements above:
-
 **Messaging cost is dominated by the round trip, not by serialisation.** JDK and
-Kryo differ by ~5% once the network is in the path (4,462 vs 4,226 QPS), against
-a ~20% gap in pure encode/decode. Optimising serialisation is rarely where the
-win is.
+Kryo differ by ~5% once the network is in the path (4,462 vs 4,226 QPS), against a
+~20% gap in pure encode/decode. Optimising serialisation is rarely the win.
 
 **ACK is the throughput knob that matters.** Turning `payload-ack` off moves
-unicast from ~1,900 to ~20,600 msg/s, an 11× difference, because the
-acknowledgement round trip dominates small-message cost. That is the setting to
-reach for, not thread counts.
+unicast from ~1,900 to ~20,600 msg/s, an 11x difference, because the
+acknowledgement round trip dominates small-message cost. Reach for that before
+thread counts.
 
-**Connection reuse decides whether TCP survives, not how fast it is.** With
-pooling disabled, 100 unicasts leave **111 sockets in TIME_WAIT**; with it
-enabled, zero. Throughput improves modestly; sustainability improves
-categorically. A short benchmark with pooling off looks healthy right until the
-socket table fills.
+**Connection reuse decides whether TCP survives, not how fast it is.** With pooling
+off, 100 unicasts leave **111 sockets in TIME_WAIT**; with it on, zero. Throughput
+improves modestly, sustainability categorically. A short benchmark with pooling off
+looks healthy right up until the socket table fills.
 
 ## Recommended configuration
 
@@ -345,37 +422,33 @@ advertise-host=10.0.1.10
 
 ### Who may become the leader
 
-By default every node contends. When several applications share one cluster name,
-some of them are poor candidates: the leader holds the lock and permit registers
-and the authoritative cache copy, so it wants a long lived, evenly loaded
-instance. An API facade that scales to zero overnight and restarts on every
-deploy will win the port as readily as anything else, and the result is a change
-of leader on every deployment.
+By default every node contends. When several applications share one cluster name
+some are poor candidates: the leader holds the lock and permit registers and the
+authoritative cache copy, so it wants a long lived, evenly loaded instance. An API
+facade that scales to zero overnight and restarts on every deploy will win the
+port just as readily, and you get a change of leader on every deployment.
 
 ```properties
-# This application joins the cluster and does the work, but never contends
-# for leadership. Set per application, not per node.
+# Joins the cluster and does the work, but never contends for leadership.
+# Set per application, not per node.
 leader-eligible=false
 ```
 
-A follower only node still joins, still gossips, still receives dispatched work.
-It differs in three places: it never claims the cluster port, it is skipped when
-the others work out whose turn it is to take over, and it advertises the fact
-through member metadata so no node has to guess.
+Such a node still joins, gossips and receives dispatched work. It never claims the
+cluster port, the others skip it when working out whose turn it is to take over,
+and it advertises the fact through member metadata so nobody has to guess.
 
-Two consequences are worth knowing before you set it.
+One consequence to know before setting it: **the leader is also the rendezvous
+point for discovery**, since discovery knocks on the cluster port and the holder of
+that port is the leader. Set this on every application and the cluster has no
+leader and the members cannot find each other either, each sitting alone with a
+member list of one. That is reported as a periodic warning rather than corrected,
+because electing someone anyway would override an explicit configuration. Starting
+one eligible application restores both, with no restart of the followers.
 
-The leader also serves as the **rendezvous point** for new nodes. Discovery knocks
-on the cluster port, and the holder of that port is the leader. So a cluster where
-every application sets `leader-eligible=false` has no leader and the members
-cannot discover each other either: each node sits alone with a member list of
-one. This is reported as a periodic warning rather than corrected, because
-electing someone anyway would override an explicit configuration. Starting one
-eligible application fixes both at once, with no restart of the followers needed.
-
-Second, components that need a leader fail rather than degrade while there is
-none. `ProcessingMutex.acquire` returns false; it does not hand out a lock that
-nobody else recognises.
+Until then, components that need a leader fail rather than degrade:
+`ProcessingMutex.acquire` returns false instead of handing out a lock nobody else
+recognises.
 
 ### Transport
 
@@ -480,53 +553,73 @@ all of this on `/actuator/prometheus` and a human-readable
 
 ## Examples
 
-Two runnable classes in `com.chaconneai.spreader.example`:
+Two runnable classes in `com.chaconneai.spreader.example`.
 
 **`BestPractice`**: forming a cluster, step by step. Each method is a working
-fragment you can lift:
+fragment you can lift, and `main()` runs a live node so you can watch a cluster
+come up:
 
 | Method | Covers |
 |---|---|
 | `minimal()` | the smallest cluster that actually works |
-| `inContainer(podIp)` | the `advertise-host` trap, which is where most container deployments stall |
+| `inContainer(podIp)` | the `advertise-host` trap, where most container deployments stall |
 | `waitUntilReady(cluster)` | what to wait for before branching on `isLeader()` |
-| `listener()` | every callback, with what you should and should not do inside each |
+| `listener()` | every callback, with what belongs inside each and what does not |
 | `sendingMessages(cluster)` | multicast, targeted multicast, unicast, key-routed unicast |
+| `severalApplications(cluster)` | `membersOf`, and why it is the method to reach for |
+| `followerOnly()` | an application that joins and works but never leads |
+| `doNotDoThis()` | why `isLeader()` is the wrong way to de-duplicate a scheduled task |
+| `observability(cluster)` | the three numbers to put on a dashboard |
 | `tunedForProduction()` | a full config with the reasoning behind each value |
 | `shutdownGracefully(cluster)` | leaving cleanly so peers do not wait out a timeout |
 
-`main()` runs the whole sequence, so you can watch the real shape of a cluster
-coming up.
+```bash
+java -cp spreader.jar com.chaconneai.spreader.example.BestPractice \
+     --cluster=demo --port=22000 --ipAddresses=127.0.0.1
+```
 
-**`GossipDemo`**: a command-line node. Start several in separate terminals and
-watch them find each other, elect a leader, and notice when you kill one:
+Start several in separate terminals, on one machine add `--portRetry=10`, and
+watch them find each other, elect a leader, and notice when you kill one.
+
+**`ReplicatedH2Example`**: a replicated H2 database, and the reference
+implementation of the pattern in the next section. Every node holds its own
+embedded H2; any node can write, a follower forwards to the leader, the leader
+applies it and broadcasts, and reads never leave the process.
 
 ```bash
-java -cp spreader.jar com.chaconneai.spreader.example.GossipDemo \
-     --cluster demo --port 22000 --peers 127.0.0.1
+java -cp spreader.jar:h2.jar \
+     com.chaconneai.spreader.example.ReplicatedH2Example --port=22000
 ```
+
+It compiles against `java.sql` alone, so H2 is needed at runtime only and is not
+a dependency of this library. Four messages make up the whole protocol: a
+forwarded write, a replicated statement, a snapshot request, and a snapshot. That
+last pair matters more than it looks: a node joining an established cluster starts
+empty, and replicating only the increments would leave it answering reads with
+nothing.
+
+Its limits are stated in the class javadoc, because they are the limits of
+asynchronous single leader replication rather than of this code: a follower read
+can lag by milliseconds, a write is lost if the leader dies between applying and
+broadcasting, and a partition lets both sides accept writes that then diverge. It
+suits reference data, dictionaries, feature flags and routing tables. It does not
+suit ledgers or stock counts.
 
 ### Building your own distributed component
 
-The pattern for putting your own logic on top of spreader is: **claim a channel,
-route through the leader, replicate the operation.**
+The pattern is: **claim a channel, route writes through the leader, replicate the
+operation, and read locally.**
 
 ```java
 // 1. A private channel. Traffic here cannot stall other components.
-cluster.addListener("inventory", new GossipListener() {
-    @Override
-    public void onPayload(Node sender, byte[] content) {
-        applyLocally(decode(content));   // every node applies the same operation
-    }
-});
+cluster.addListener("inventory", (sender, content) -> applyLocally(decode(content)));
 
 // 2. Writes go through the leader, which gives them a total order.
 if (cluster.isLeader()) {
-    long version = nextVersion();
     applyLocally(op);
-    cluster.multicastOn("inventory", null, encode(op, version));
+    cluster.multicastOn("inventory", null, encode(op, nextVersion()), false);
 } else {
-    cluster.unicast(cluster.leader(), encode(op));   // forward, let the leader sequence it
+    cluster.sendToLeaderOn("inventory", encode(op));
 }
 
 // 3. Reads never leave the process.
@@ -535,62 +628,60 @@ public Item read(String id) {
 }
 ```
 
-Three decisions make this work, and all three are worth copying:
+Three decisions make it work:
 
 **Replicate the operation, not the state.** Sending `setbit(k, 12345)` costs one
-datagram no matter how large the bitmap is. Sending the bitmap costs the bitmap.
+datagram whatever the size of the bitmap. Sending the bitmap costs the bitmap.
 
-**Let the leader assign the order.** Every node applies the same operations in
-the same sequence, so replicas converge without any merge logic. Followers
-forward writes rather than applying them locally.
+**Let the leader assign the order.** Every node applies the same operations in the
+same sequence, so replicas converge with no merge logic. Followers forward writes
+rather than applying them locally.
 
-**Number every operation.** A follower that receives version 7 while sitting at
-version 5 knows it missed one, and can ask for a full snapshot instead of
-silently diverging. Gaps are inevitable on UDP; noticing them is what keeps
-replicas honest.
+**Number every operation.** A follower receiving version 7 while sitting at 5
+knows it missed one and can ask for a snapshot instead of diverging silently. Gaps
+are inevitable on UDP; noticing them is what keeps replicas honest.
 
-The `openspreader` starter is this pattern applied seven times: distributed
-lock, semaphore, latch, barrier, replicated cache, task distribution, RPC. If
-you want a worked reference rather than a sketch, read
-`com.chaconneai.openspreader.cache.CacheService`.
+`ReplicatedH2Example` above is this pattern end to end in 350 lines. The
+[`openspreader`](https://github.com/chaconne-ai/openspreader) starter is the same
+pattern applied to a distributed lock, semaphore, latch, barrier, replicated
+cache, task distribution and RPC.
 
 ## How this is verified
 
-**In-JVM suite: 642 cases per cell, 16 cells.** Multi-node clusters in one JVM,
-run across the full matrix of 4 transport implementations × 2 protocols × 2
-serializations. All four speak the same wire format, and "still interoperates"
-is a claim that has to be re-checked on every change, not assumed.
+**In-JVM suite, run across 4 transport implementations x 2 protocols x 2
+serializations.** Multi-node clusters inside one JVM with real sockets and real
+serialisation. All four transports speak the same wire format, and "still
+interoperates" is a claim to re-check on every change rather than assume. The
+mainline eight cells (TCP/UDP x NIO/NETTY x JDK/KRYO) run 637 cases per cell and
+are green as of 2026-09-26; the full sixteen-cell matrix adds the transport layer
+and process lifecycle suites.
 
-TCP finishes the same 642 cases about 40% faster than UDP (145s vs 233s).
-UDP pays for fragment reassembly and idempotent de-duplication that TCP hands
-to the kernel.
+TCP finishes the same cases about 40% faster than UDP (145s vs 233s): UDP pays for
+fragment reassembly and idempotent de-duplication that TCP hands to the kernel.
 
 **Cross-container clusters.** Three containers on a fixed-IP subnet, started
-simultaneously so they genuinely race for the cluster port. Fixed IPs rather
-than service names on purpose: Docker's DNS would quietly paper over a
-misconfigured `advertise-host`, and that misconfiguration is the single most
-common way a containerised cluster fails to form.
+simultaneously so they genuinely race for the cluster port. Fixed IPs rather than
+service names on purpose, because Docker's DNS would paper over a misconfigured
+`advertise-host`, and that is the single most common way a containerised cluster
+fails to form.
 
-This layer earned its place. Leadership rests on holding the cluster port, and
-on one machine that *is* mutual exclusion: the kernel refuses the second bind.
-Across machines each host binds its own 22000 with no conflict at all, and the
-discovery path had quietly inherited the single-machine assumption: a node
-holding the port concluded it was the leader and stopped looking for others.
-Three containers started together produced three isolated single-node clusters
-that never merged. Every in-JVM test passed throughout.
-
-The fix makes an isolated node keep scanning even while holding the port, and
-yield to whoever ranks first. Recovery now happens faster than a 0.5s sampling
-loop can catch, visible only in the `splitBrainOccurrences` counter, which is
-exactly why that counter exists.
+That layer earned its place by catching a real bug that every in-JVM test missed.
+Leadership rests on holding the cluster port, and on one machine that **is** mutual
+exclusion, since the kernel refuses the second bind. Across machines each host
+binds its own 22000 with no conflict at all, and the discovery path had quietly
+inherited the single-machine assumption: a node holding the port concluded it led
+and stopped looking for others. Three containers started together produced three
+isolated single-node clusters that never merged. The fix makes an isolated node keep
+scanning even while holding the port, and yield to whoever ranks first.
 
 ## Limits
 
 Worth knowing before you adopt it:
 
-- **Leadership is not consensus.** Under partition, two sides can each elect a
-  leader. It heals when the partition does. If double execution is unacceptable,
-  use Raft.
+- **Election is pre-emptive, not consensus-based.** Under partition, two sides
+  can each elect a leader. It heals when the partition does, and every occurrence
+  is counted. Where a repeat would cause real harm, that route is the wrong one:
+  use consensus-based election, or carry a fencing token into whatever you write.
 - **Membership is eventually consistent.** Right after a change, different nodes
   briefly hold different views.
 - **UDP messages can be lost.** `payload-ack` covers it with resend and dedup,
@@ -635,9 +726,9 @@ A few things worth knowing before you open one:
 - **Comments are written in English**, and they explain *why* rather than
   restating *what*. The reasoning behind a non-obvious decision is the part
   worth writing down.
-- **Nothing may be added to the runtime dependencies.** `slf4j-api` alone is a
-  design constraint, not an accident. An optional dependency, guarded so the
-  library works without it, is a different matter.
+- **Nothing may be added to the runtime dependencies.** That is a design
+  constraint, not an accident. An optional dependency, guarded so the library
+  works without it, is a different matter.
 
 ## License
 

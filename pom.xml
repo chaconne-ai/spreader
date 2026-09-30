@@ -146,15 +146,15 @@
                 </executions>
             </plugin>
 
-            <!-- Javadoc jar for publishing. doclint is off so a missing @param tag
-                 cannot block a release. The optional dependencies are on the javadoc
-                 classpath so links into them resolve. -->
+            <!-- Javadoc jar for publishing. doclint=reference reports a {@link} whose
+                 target no longer exists, which is how stale comments get caught; it does
+                 not check for missing @param. failOnError=false keeps it to a warning. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-javadoc-plugin</artifactId>
                 <version>3.11.2</version>
                 <configuration>
-                    <doclint>none</doclint>
+                    <doclint>reference</doclint>
                     <quiet>true</quiet>
                     <encoding>UTF-8</encoding>
                     <charset>UTF-8</charset>

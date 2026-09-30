@@ -11,40 +11,14 @@
 
     <name>spreader</name>
     <description>
-        Decentralized clustering for Java on the Gossip/SWIM protocol: instances form
-        a cluster in seconds, elect a leader, keep a live view of every member, and
-        multicast or unicast messages to one another.
-
-        Every node runs the same code and holds the same complete member list.
-        Membership spreads by SWIM gossip, point to point between randomly chosen
-        peers and never through a coordinator, so no node exists whose loss stops the
-        rest. A node that dies is found by direct probe, then by indirect probe
-        through other members, then by a suspect timeout. There is no ZooKeeper, no
-        etcd and no external coordinator anywhere in the picture.
-
-        Leadership needs no consensus round: whoever seizes the cluster port is the
-        leader, and the operating system already guarantees that only one process can
-        hold a port. That is what keeps the library this small, and the limit it
-        implies is stated rather than hidden: this is not Raft, so under a network
-        partition two sides can each hold a leader. Recovery is sub-second and every
-        occurrence is counted.
-
-        Messaging comes with membership: multicast, multicast to one application,
-        unicast, unicast routed by consistent hash on a key, and send-to-leader, with
-        round-robin, random and weighted balancing choosable per call. Independent
-        named channels keep a busy topic from stalling a quiet one, and every dispatch
-        queue is bounded, with whatever it drops counted rather than lost silently.
-
-        Transports are pluggable: the built-in NIO one, or Netty, MINA and Grizzly,
-        over either TCP or UDP. All four speak the same wire format, so nodes running
-        different implementations can share one cluster.
-
-        Per-channel observability is built in: throughput, concurrency, latency
-        percentiles, error rates, buffer watermarks and a split-brain counter.
-
-        Measured on the built-in transport over TCP: 18,464 cross-node
-        request/response round trips per second, and 5.3 million in-process
-        dispatches per second.
+        Decentralized clustering for Java on the Gossip/SWIM protocol: JVM instances
+        form a cluster in seconds, elect a leader, keep a live view of every member,
+        and multicast or unicast messages to one another. No ZooKeeper, no etcd and
+        no registry: every node runs the same code and holds the same complete member
+        list. Election is pre-emptive rather than consensus-based, which fits
+        coordination where a repeat is merely wasteful; under a network partition two
+        sides can each hold a leader. Four transports (built-in NIO, Netty, MINA,
+        Grizzly) over TCP or UDP, all speaking one wire format.
     </description>
     <url>https://github.com/chaconne-ai/spreader</url>
     <inceptionYear>2026</inceptionYear>
@@ -89,32 +63,19 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <!-- Matches the version Spring Boot 4.1.0 manages, so spreader-commons
-             and this module never disagree on it. -->
         <slf4j.version>2.0.18</slf4j.version>
     </properties>
 
     <dependencies>
-        <!--
-          The only non-optional dependency. slf4j-api is a facade, not an
-          implementation: it pulls in nothing itself and binds to whatever the
-          application already uses (Logback under Spring Boot, JUL, Log4j2...).
-          With no binding on the classpath it degrades to a no-op plus one
-          warning, so it never dictates how a downstream project logs.
-        -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
             <version>${slf4j.version}</version>
         </dependency>
 
-        <!--
-          The transports below are all optional, so nothing is forced on downstream
-          projects: with none of them the built-in NIO transport is used. Add one and
-          set spring.spreader.advanced.transport-provider to switch. Configuring a
-          provider whose library is missing falls back to NIO with a warning instead
-          of failing.
-        -->
+        <!-- Optional transports. With none of them the built-in NIO one is used;
+             switch with spring.spreader.advanced.transport-provider. Naming a
+             provider whose library is absent falls back to NIO with a warning. -->
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-all</artifactId>
@@ -185,20 +146,15 @@
                 </executions>
             </plugin>
 
-            <!--
-              Javadoc jar for publishing. doclint is off: the docs here are written
-              for people reading the source, and blocking a release over a missing
-              @param tag helps nobody.
-
-              Optional dependencies (Netty, MINA, Grizzly, JCTools) are on the
-              javadoc classpath, so links into them resolve instead of erroring.
-            -->
+            <!-- Javadoc jar for publishing. doclint=reference reports a {@link} whose
+                 target no longer exists, which is how stale comments get caught; it does
+                 not check for missing @param. failOnError=false keeps it to a warning. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-javadoc-plugin</artifactId>
                 <version>3.11.2</version>
                 <configuration>
-                    <doclint>none</doclint>
+                    <doclint>reference</doclint>
                     <quiet>true</quiet>
                     <encoding>UTF-8</encoding>
                     <charset>UTF-8</charset>
@@ -231,16 +187,12 @@
     </build>
 
     <!--
-      Signing lives in a profile, so it runs only when a release is actually being
-      published: mvn deploy -Prelease
-      Why not in the build section: every ordinary build reaches the verify phase
-      (install does, and so does the whole test matrix inside Docker), and signing
-      there means every one of them needs a GPG key present. The container has none.
+      Signing is in a profile so ordinary builds need no GPG key: install and the
+      Docker test matrix both reach verify, and the container has no key.
 
-      The price of this choice, stated plainly: forgetting -Prelease publishes
-      UNSIGNED artifacts. Central rejects an unsigned release, so a real release
-      fails loudly; a SNAPSHOT does not require signatures and would go up quietly.
-      So the rule is simple: releases are always deployed with -Prelease.
+      The catch: forgetting -Prelease publishes UNSIGNED artifacts. Central rejects
+      an unsigned release loudly, but a SNAPSHOT goes up quietly. So always
+      release with: mvn deploy -Prelease
     -->
     <profiles>
         <profile>
@@ -253,13 +205,9 @@
                         <artifactId>maven-gpg-plugin</artifactId>
                         <version>3.2.8</version>
 
-                        <!--
-                          Loopback pinentry. The plugin runs gpg in batch mode, and with no
-                          graphical pinentry installed gpg has nowhere to ask for the
-                          passphrase, so it fails with "Inappropriate ioctl for device".
-                          Loopback makes gpg take the passphrase from Maven instead, given
-                          as -Dgpg.passphrase on the command line or set in settings.xml.
-                        -->
+                        <!-- Loopback pinentry: gpg runs in batch mode here, so without it
+                             it fails with "Inappropriate ioctl for device". The passphrase
+                             comes from -Dgpg.passphrase or settings.xml. -->
                         <configuration>
                             <gpgArguments>
                                 <arg>--pinentry-mode</arg>

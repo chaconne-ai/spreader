@@ -16,6 +16,7 @@
 package com.chaconneai.spreader.event;
 
 import com.chaconneai.spreader.metrics.BufferMetrics;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
 import com.chaconneai.spreader.util.ExecutorUtils;
 import com.chaconneai.spreader.util.NamedThreadFactory;
 import org.slf4j.Logger;
@@ -137,6 +138,17 @@ public class EventBus {
     private final Logger log;
     private volatile boolean closed;
 
+    /**
+     * Where the handling stage is recorded. {@link MetricsRegistry#DISABLED} until the
+     * cluster supplies its own, so an EventBus built on its own costs nothing.
+     */
+    private volatile MetricsRegistry metrics = MetricsRegistry.DISABLED;
+
+    /** Called by the cluster once, at construction. Not for application code. */
+    public void bindMetrics(MetricsRegistry registry) {
+        this.metrics = registry == null ? MetricsRegistry.DISABLED : registry;
+    }
+
     public EventBus(Logger log) {
         this(log, 1);
     }
@@ -186,7 +198,13 @@ public class EventBus {
      */
     public void addListener(String channel, GossipListener listener) {
         if (listener != null) {
-            listeners.add(new Subscription(listener, channel == null ? DEFAULT_CHANNEL : channel));
+            if (listener instanceof BufferedGossipListener buffered) {
+                // It records the handling stage from its own consumer thread, so it needs
+                // the channel it was subscribed to; getChannel() only reports the fallback
+                buffered.bindMetrics(channel, metrics);
+            }
+            listeners.add(new Subscription(listener,
+                    channel == null ? DEFAULT_CHANNEL : channel));
         }
     }
 
@@ -327,11 +345,33 @@ public class EventBus {
             if (isPayload && !s.channel().equals(event.channel())) {
                 continue;
             }
+            // The handling stage is bracketed here, per listener, because this is the only
+            // place that knows both the listener and the channel it subscribed to.
+            //
+            // How far "handling" reaches is up to the listener, and that is the honest
+            // answer rather than a leaky one: a listener that does the work in onPayload is
+            // measured end to end, while one that hands the work to a pool of its own has
+            // the handover measured. Reaching into someone else's pool is not possible from
+            // here, and calling the handover "handling" is at least true at this layer
+            // A listener that records the stage itself is skipped here, or the same piece
+            // of work would be counted twice
+            boolean meter = isPayload && !s.listener().defersHandling();
+            long handleStart = meter ? metrics.onHandleStart(s.channel()) : 0L;
+            if (meter) {
+                metrics.onHandleStart();
+            }
+            boolean handled = false;
             try {
                 s.listener().onEvent(event);
                 dispatchTyped(s.listener(), event);
+                handled = true;
             } catch (Throwable t) {
                 log.error("Event listener threw: " + event, t);
+            } finally {
+                if (meter) {
+                    metrics.onHandleEnd(s.channel(), handleStart, handled);
+                    metrics.onHandleEnd(handleStart, handled);
+                }
             }
         }
     }

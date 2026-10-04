@@ -78,14 +78,23 @@ public record ChannelMetrics(
         long received,
         long receiveFailures,
         long duplicates,
+        long handled,
+        long handledFailures,
         int inflight,
         int peakInflight,
+        int arriving,
+        int peakArriving,
+        int handling,
+        int peakHandling,
         double sentTps,
         double receivedTps,
+        double handledTps,
         double peakSentTps,
         double peakReceivedTps,
+        double peakHandledTps,
         LatencySnapshot outboundLatency,
-        LatencySnapshot inboundProcessing) {
+        LatencySnapshot inboundProcessing,
+        LatencySnapshot handleLatency) {
 
     /** Total TPS: sends plus receives in the last complete second. */
     public double tps() {
@@ -133,6 +142,73 @@ public record ChannelMetrics(
         return total == 0 ? 0d : (double) retries / total;
     }
 
+
+    /** An all-zero snapshot. What a channel with no traffic yet reads as, rather than null. */
+    public static ChannelMetrics empty(String channel) {
+        return new ChannelMetrics(channel, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+                0d, 0d, 0d, 0d, 0d, 0d,
+                LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY);
+    }
+
+    // ------------------------------------------------------------------
+    // The three stages, by their plain names
+    // ------------------------------------------------------------------
+
+    /**
+     * Messages sent per second.
+     *
+     * <p>The outbound stage. Its concurrency is {@link #inflight()} and its latency
+     * {@link #outboundLatency()}, which measures the wait for the answer.
+     */
+    public double sendRate() {
+        return sentTps;
+    }
+
+    /**
+     * Messages <b>arriving</b> per second: taken in, not yet dealt with.
+     *
+     * <p>Industry usage would call this QPS, but QPS and TPS are near synonyms out there and
+     * both tend to mean throughput, so neither word is used here.
+     */
+    public double arrivalRate() {
+        return receivedTps;
+    }
+
+    /**
+     * Messages <b>finished</b> per second, successes and failures alike.
+     *
+     * <p>The distance from {@link #arrivalRate()} is the useful part: equal in the steady
+     * state, and a persistent shortfall means work is piling up or being dropped.
+     */
+    public double completionRate() {
+        return handledTps;
+    }
+
+    /**
+     * How much work is in hand at this instant: {@link #handling()}.
+     *
+     * <p>Deliberately <b>not</b> called {@code concurrency}. That word is already taken by
+     * the published contract, where {@code concurrency} means {@link #inflight()}, the
+     * outbound requests still waiting for an answer. Two layers using one word for two
+     * quantities is worse than an ugly name, so the stages keep their own:
+     * {@code inflight} for outbound, {@code handling} for work being done.
+     *
+     * <p>By Little's law each should be about its own rate times its own latency, which
+     * makes the two a check on each other.
+     */
+    /**
+     * The share of finished work that failed, 0 to 1.
+     *
+     * <p>Distinct from {@link #sendErrorRate()}: a send that fails did not reach the far
+     * end, while a handling that fails arrived and was worked on, and the work came out
+     * wrong. The two call for different action, so they are not pooled into one figure.
+     */
+    public double handleErrorRate() {
+        long total = handled + handledFailures;
+        return total == 0 ? 0d : (double) handledFailures / total;
+    }
+
     /** Not a single message has passed through. Used to skip output so that all-zero channels do not flood the display. */
     public boolean isIdle() {
         return sent == 0 && sendFailures == 0 && received == 0 && receiveFailures == 0;
@@ -149,11 +225,14 @@ public record ChannelMetrics(
                 + "sent=" + sent + "(failed " + sendFailures + ", retried " + retries + ")"
                 + ", received=" + received + "(failed " + receiveFailures
                 + ", duplicate " + duplicates + ")"
+                + ", handled=" + handled + "(failed " + handledFailures + ")"
                 + ", inflight=" + inflight + "(peak " + peakInflight + ")"
+                + ", concurrency=" + handling + "(peak " + peakHandling + ")"
                 + ", TPS=" + String.format("%.1f", tps())
                 + "(peak " + String.format("%.1f", peakTps()) + ")"
                 + ", errorRate=" + String.format("%.2f%%", errorRate() * 100)
                 + "\n  outbound latency: " + outboundLatency
-                + "\n  inbound processing: " + inboundProcessing;
+                + "\n  inbound processing: " + inboundProcessing
+                + "\n  handling: " + handleLatency;
     }
 }

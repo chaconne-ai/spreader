@@ -17,6 +17,7 @@ package com.chaconneai.spreader.event;
 
 import com.chaconneai.spreader.Node;
 import com.chaconneai.spreader.metrics.BufferMetrics;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
 import com.chaconneai.spreader.util.NamedThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,6 +92,17 @@ public abstract class BufferedGossipListener implements GossipListener {
 
     private final PayloadQueue<Payload> buffer;
     private final String name;
+
+    /**
+     * Where the handling stage is recorded, and the channel it is recorded under.
+     *
+     * <p>Both are supplied by the event bus at subscription time, because only it knows
+     * which channel this listener was attached to. Until then recording is a no-op, so a
+     * listener used outside a cluster costs nothing.
+     */
+    private volatile MetricsRegistry metrics = MetricsRegistry.DISABLED;
+
+    private volatile String channel = MetricsRegistry.DEFAULT_CHANNEL;
     private final int consumerCount;
     private final Logger log;
 
@@ -262,14 +274,38 @@ public abstract class BufferedGossipListener implements GossipListener {
         LockSupport.parkNanos(100_000L);
     }
 
+    /** Called by the event bus when this listener is subscribed. */
+    void bindMetrics(String channel, MetricsRegistry registry) {
+        this.channel = channel == null || channel.isEmpty()
+                ? MetricsRegistry.DEFAULT_CHANNEL : channel;
+        this.metrics = registry == null ? MetricsRegistry.DISABLED : registry;
+    }
+
+    /**
+     * Yes: the work happens on the consumer thread, not in {@code onPayload}, so this class
+     * records the handling stage from {@link #dispatchOne} instead of letting the event bus
+     * time the queueing and call it handling.
+     */
+    @Override
+    public boolean defersHandling() {
+        return true;
+    }
+
     private void dispatchOne(Payload payload) {
+        long start = metrics.onHandleStart(channel);
+        metrics.onHandleStart();
+        boolean ok = false;
         try {
             handlePayload(payload.sender(), payload.content());
             handled.incrementAndGet();
+            ok = true;
         } catch (Throwable t) {
             // One failed message must not kill the consumer thread -- that would leave
             // every message behind it unprocessed
             log.error("Listener " + name + " failed to handle a message", t);
+        } finally {
+            metrics.onHandleEnd(channel, start, ok);
+            metrics.onHandleEnd(start, ok);
         }
     }
 

@@ -23,6 +23,7 @@ import com.chaconneai.spreader.event.GossipListener;
 import com.chaconneai.spreader.loadbalance.LoadBalancer;
 import com.chaconneai.spreader.membership.MemberList;
 import com.chaconneai.spreader.metrics.BufferMetrics;
+import com.chaconneai.spreader.metrics.NodeMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
 import com.chaconneai.spreader.metrics.MetricsRegistry;
 import com.chaconneai.spreader.metrics.SplitBrainStatus;
@@ -179,6 +180,8 @@ class DefaultGossipCluster implements GossipCluster {
                 config.payloadDedupTtlMs(), config.payloadDedupMaxEntries());
         this.metrics = config.metricsEnabled()
                 ? new MetricsRegistry() : MetricsRegistry.DISABLED;
+        // After metrics is assigned, not before: binding earlier would hand over a null
+        this.eventBus.bindMetrics(this.metrics);
         this.transport = createTransport(config);
     }
 
@@ -1005,6 +1008,43 @@ class DefaultGossipCluster implements GossipCluster {
     // Inbound message handling
     // ------------------------------------------------------------------
 
+    /**
+     * A control-plane request, with the node-level send counters around it.
+     *
+     * <p>Gossip's own chatter belongs to no channel, so it is recorded only at the instance
+     * level. Routing every control-plane call through here keeps that in one place instead
+     * of six.
+     */
+    private Message controlRequest(InetSocketAddress addr, Message request, int timeoutMs)
+            throws IOException {
+        long start = metrics.onSendStart(MetricsRegistry.SYSTEM_CHANNEL);
+        metrics.onSendStart();
+        boolean ok = false;
+        try {
+            Message reply = transport.request(addr, request, timeoutMs);
+            ok = true;
+            return reply;
+        } finally {
+            metrics.onSendEnd(MetricsRegistry.SYSTEM_CHANNEL, start, ok, 0);
+            metrics.onSendEnd(start, ok, 0);
+        }
+    }
+
+    /** As {@link #controlRequest}, for a message that expects no answer. */
+    private void controlSend(InetSocketAddress addr, Message message, int timeoutMs)
+            throws IOException {
+        long start = metrics.onSendStart(MetricsRegistry.SYSTEM_CHANNEL);
+        metrics.onSendStart();
+        boolean ok = false;
+        try {
+            transport.send(addr, message, timeoutMs);
+            ok = true;
+        } finally {
+            metrics.onSendEnd(MetricsRegistry.SYSTEM_CHANNEL, start, ok, 0);
+            metrics.onSendEnd(start, ok, 0);
+        }
+    }
+
     private Message onMessage(Message msg, InetSocketAddress remote) {
         // One-way messages are never answered: the sender does not read a response, and
         // bytes sent back would sit on the connection and impersonate the next request's
@@ -1029,16 +1069,46 @@ class DefaultGossipCluster implements GossipCluster {
                     .build();
         }
 
-        return switch (msg.type()) {
-            case PROBE -> handleProbe(msg);
-            case JOIN -> handleJoin(msg);
-            case PING, SYNC -> handlePing(msg);
-            case PING_REQ -> handlePingReq(msg);
-            case LEAVE -> handleLeave(msg);
-            case PAYLOAD, PAYLOAD_ONEWAY -> handlePayload(msg);
-            // ACK-family messages only appear in the requester's synchronous read and never reach here
-            case ACK, JOIN_ACK, PROBE_ACK -> null;
-        };
+        // Intake is recorded here for EVERY message type, at the instance level and, for
+        // gossip's own traffic, under the system channel as well.
+        //
+        // Heartbeat, probe, membership sync, join and leave belong to no application
+        // channel, but they are far from free: in a large cluster they are most of what
+        // crosses the wire. Filing them under one channel of their own makes "how much of
+        // this is just gossip keeping the cluster together" a question with an answer,
+        // rather than an unexplained gap between the two levels.
+        //
+        // The control plane is also handled synchronously right here, so for anything that
+        // is not a payload the handling stage is bracketed alongside. A payload only gets
+        // queued here; its handling is recorded later, by the listener that deals with it
+        boolean payload = msg.type() == MessageType.PAYLOAD
+                || msg.type() == MessageType.PAYLOAD_ONEWAY;
+        long nodeReceive = metrics.onReceiveStart();
+        long sysReceive = payload ? 0L : metrics.onReceiveStart(MetricsRegistry.SYSTEM_CHANNEL);
+        long nodeHandle = payload ? 0L : metrics.onHandleStart();
+        long sysHandle = payload ? 0L : metrics.onHandleStart(MetricsRegistry.SYSTEM_CHANNEL);
+        boolean nodeOk = false;
+        try {
+            Message reply = switch (msg.type()) {
+                case PROBE -> handleProbe(msg);
+                case JOIN -> handleJoin(msg);
+                case PING, SYNC -> handlePing(msg);
+                case PING_REQ -> handlePingReq(msg);
+                case LEAVE -> handleLeave(msg);
+                case PAYLOAD, PAYLOAD_ONEWAY -> handlePayload(msg);
+                // ACK-family messages only appear in the requester's synchronous read and never reach here
+                case ACK, JOIN_ACK, PROBE_ACK -> null;
+            };
+            nodeOk = true;
+            return reply;
+        } finally {
+            metrics.onReceiveEnd(nodeReceive, nodeOk);
+            if (!payload) {
+                metrics.onReceiveEnd(MetricsRegistry.SYSTEM_CHANNEL, sysReceive, nodeOk);
+                metrics.onHandleEnd(nodeHandle, nodeOk);
+                metrics.onHandleEnd(MetricsRegistry.SYSTEM_CHANNEL, sysHandle, nodeOk);
+            }
+        }
     }
 
     private static MessageType respondType(MessageType requestType) {
@@ -1170,6 +1240,7 @@ class DefaultGossipCluster implements GossipCluster {
         if (sender != null) {
             if (deduplicator.isDuplicate(sender.id(), msg.seq())) {
                 metrics.onDuplicate(channel);
+                metrics.onDuplicate();
                 log.debug("Discarding a duplicate business message: sender={}, seq={}", sender.label(), msg.seq());
             } else {
                 // What is measured here is DELIVERY time, not business processing time:
@@ -1401,6 +1472,29 @@ class DefaultGossipCluster implements GossipCluster {
     }
 
     @Override
+    public NodeMetrics nodeMetrics() {
+        Node self = memberList.self();
+        Node leader = memberList.leader();
+        return new NodeMetrics(
+                config.clusterName(),
+                self.id(),
+                self.name(),
+                self.address(),
+                memberList.isLeader(),
+                leader == null ? null : leader.address(),
+                isOnBreak(),
+                memberList.members().size(),
+                // Uptime comes from the node's own startTime rather than a field of this
+                // class: it is already on the wire for the election's tie-break, so there is
+                // no second source of truth to keep in step
+                System.currentTimeMillis() - self.startTime(),
+                System.currentTimeMillis(),
+                bufferMetrics(),
+                splitBrainStatus(),
+                metrics.nodeSnapshot());
+    }
+
+    @Override
     public List<BufferMetrics> bufferMetrics() {
         return eventBus.bufferMetrics();
     }
@@ -1625,6 +1719,9 @@ class DefaultGossipCluster implements GossipCluster {
                 .build();
 
         long started = metrics.onSendStart(channel);
+        // The instance-wide counters are fed by their own call rather than summed from the
+        // channels afterwards. Same instant, so the one timestamp serves both
+        metrics.onSendStart();
         if (!ack) {
             // Unacknowledged: what is measured is the time to write to the network, with no
             // round trip. It is still worth having -- failing to write at all (a full buffer,
@@ -1632,9 +1729,11 @@ class DefaultGossipCluster implements GossipCluster {
             try {
                 transport.send(target.socketAddress(), msg, config.probeTimeoutMs());
                 metrics.onSendEnd(channel, started, true, 0);
+                metrics.onSendEnd(started, true, 0);
                 return true;
             } catch (IOException e) {
                 metrics.onSendEnd(channel, started, false, 0);
+                metrics.onSendEnd(started, false, 0);
                 log.warn("Sending a business message to {} failed: {}", target.label(), e.toString());
                 return false;
             }
@@ -1644,6 +1743,7 @@ class DefaultGossipCluster implements GossipCluster {
         for (int i = 0; i < attempts; i++) {
             if (i > 0 && !sleepBeforeRetry()) {
                 metrics.onSendEnd(channel, started, false, i);
+                metrics.onSendEnd(started, false, i);
                 return false;
             }
             try {
@@ -1657,6 +1757,7 @@ class DefaultGossipCluster implements GossipCluster {
                     // backoff included -- that is what the caller actually waited. Timing only
                     // the last attempt would make the latency look absurdly good
                     metrics.onSendEnd(channel, started, true, i);
+                    metrics.onSendEnd(started, true, i);
                     return true;
                 }
                 // The peer refused explicitly, for instance because it is not ready yet, so
@@ -1668,6 +1769,7 @@ class DefaultGossipCluster implements GossipCluster {
             }
         }
         metrics.onSendEnd(channel, started, false, config.payloadRetries());
+        metrics.onSendEnd(started, false, config.payloadRetries());
         log.warn("Sending a business message to {} failed after {} retransmission(s); discarding it",
                 target.label(), config.payloadRetries());
         return false;

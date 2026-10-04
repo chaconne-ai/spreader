@@ -42,19 +42,70 @@ import java.util.concurrent.atomic.LongAdder;
  * observability is unwanted -- embedded deployments, or extreme latency sensitivity --
  * and the JIT inlines the empty methods away entirely.
  *
- * @see ChannelMetrics
- *
  * @author Fred Feng
  * @version 1.0.0
+ * @see ChannelMetrics
  * @since 20/08/2026
  */
 public class MetricsRegistry {
 
-    /** An instance that records nothing, for turning observability off. */
+    /**
+     * An instance that records nothing, for turning observability off.
+     */
+    /** What the default channel is called, at both the metrics and the listener level. */
+    public static final String DEFAULT_CHANNEL = "default";
+
+    /**
+     * The channel gossip's own traffic is filed under: heartbeat, probe, membership sync,
+     * join, leave.
+     *
+     * <p>It carries the {@code spreader.} prefix so that {@link ChannelMetrics#isSystemChannel()}
+     * recognises it alongside the other framework channels. Called {@code system} without the
+     * prefix, it would be counted as one of the application's own, and the business versus
+     * framework split would quietly be wrong.
+     *
+     * <p>Having it as a channel rather than only an instance-level figure is what makes
+     * "how much of this is just gossip keeping the cluster together" answerable on its own,
+     * instead of as an unexplained gap between the two levels.
+     */
+    public static final String SYSTEM_CHANNEL = "spreader.system";
+
     public static final MetricsRegistry DISABLED = new MetricsRegistry(false);
 
+    /**
+     * How a channel is written for a human: in a URL path, a Prometheus label, a report.
+     *
+     * <p>Two keys read differently from the way they are stored. The default channel is
+     * stored as {@code "default"} and shows as such. Gossip's own traffic is stored as
+     * {@code "spreader.system"}, because the prefix is what marks a channel as the
+     * framework's rather than the application's, but it shows as plain {@code "system"}:
+     * the prefix is an internal convention and carries no meaning for whoever reads the
+     * output.
+     */
+    public static String displayName(String channel) {
+        if (channel == null || channel.isEmpty()) {
+            return DEFAULT_CHANNEL;
+        }
+        return SYSTEM_CHANNEL.equals(channel) ? "system" : channel;
+    }
+
+    /**
+     * The reverse of {@link #displayName}: what a reader typed, turned back into the key.
+     *
+     * <p>So that {@code /actuator/spreader/system} finds the same data that
+     * {@code /actuator/spreader/spreader.system} does, and neither quietly returns an
+     * all-zero record.
+     */
+    public static String channelKey(String display) {
+        if (display == null || display.isEmpty() || DEFAULT_CHANNEL.equals(display)) {
+            return DEFAULT_CHANNEL;
+        }
+        return "system".equals(display) ? SYSTEM_CHANNEL : display;
+    }
+
     private final boolean enabled;
-    private final Map<String, ChannelRecorder> channels = new ConcurrentHashMap<>();
+    private final Map<String, MetricRecorder> channels = new ConcurrentHashMap<>();
+    private final MetricRecorder nodeRecorder = new MetricRecorder();
 
     public MetricsRegistry() {
         this(true);
@@ -83,13 +134,21 @@ public class MetricsRegistry {
      * @return the start time in nanoseconds, or 0 when observability is off
      */
     public long onSendStart(String channel) {
+        return onSendStart(recorder(channel));
+    }
+
+    /** The instance-wide counterpart: no channel, so it lands on the node recorder. */
+    public long onSendStart() {
+        return onSendStart(nodeRecorder);
+    }
+
+    private long onSendStart(MetricRecorder r) {
         if (!enabled) {
             return 0L;
         }
-        // Concurrency +1, on a counter shared with the inbound side. "How many messages
-        // are in flight right now" ought to count both the ones sent and not yet
-        // answered and the ones received and still being processed
-        recorder(channel).inflight.incrementAndGet();
+        // Outbound in flight +1: sent and not yet acknowledged. This is NOT the processing
+        // concurrency -- that one is bracketed by onHandleStart/onHandleEnd
+        r.inflight.incrementAndGet();
         return System.nanoTime();
     }
 
@@ -101,10 +160,18 @@ public class MetricsRegistry {
      * @param retries    how many retries this send took; pass 0 for none
      */
     public void onSendEnd(String channel, long startNanos, boolean success, int retries) {
+        onSendEnd(recorder(channel), startNanos, success, retries);
+    }
+
+    /** The instance-wide counterpart. */
+    public void onSendEnd(long startNanos, boolean success, int retries) {
+        onSendEnd(nodeRecorder, startNanos, success, retries);
+    }
+
+    private void onSendEnd(MetricRecorder r, long startNanos, boolean success, int retries) {
         if (!enabled) {
             return;
         }
-        ChannelRecorder r = recorder(channel);
         int now = r.inflight.decrementAndGet();
         // The peak is updated here rather than at start: the value read at start could
         // be changed by someone else a moment later, whereas this one is a concurrency
@@ -128,38 +195,57 @@ public class MetricsRegistry {
     }
 
     // ------------------------------------------------------------------
-    // Instrumentation: inbound
+    // Instrumentation: arrival, the second stage
     // ------------------------------------------------------------------
 
     /**
-     * Inbound processing begins.
+     * A message has arrived and is being taken in.
      *
-     * <p>Concurrency goes {@code +1} here. It counts how many messages are being handled
-     * at this instant, and that includes <b>both</b> outbound requests in flight and
-     * inbound messages being processed. Counting only one side would leave a
-     * receive-only node reporting a concurrency of 0 while it was in fact saturated.
+     * <p>This stage ends the moment the message is <b>accepted</b> (queued for a listener),
+     * not when a listener has dealt with it. That is the third stage,
+     * {@link #onHandleStart}. Keeping them apart is the point: the gap between the two
+     * rates is the backlog, and the gap between arrivals and the two of them together is
+     * what was dropped.
      */
     public long onReceiveStart(String channel) {
+        return onReceiveStart(recorder(channel));
+    }
+
+    /** The instance-wide counterpart. */
+    public long onReceiveStart() {
+        return onReceiveStart(nodeRecorder);
+    }
+
+    private long onReceiveStart(MetricRecorder r) {
         if (!enabled) {
             return 0L;
         }
-        recorder(channel).inflight.incrementAndGet();
+        r.arriving.incrementAndGet();
         return System.nanoTime();
     }
 
     /**
-     * Inbound processing ends; concurrency goes {@code -1}.
+     * Taking the message in has finished.
      *
      * @param startNanos whatever {@link #onReceiveStart} returned
-     * @param success    whether the handler ran to completion
+     * @param success    whether it was accepted; false means it was turned away, which is
+     *                   what {@code dropRate} counts
      */
     public void onReceiveEnd(String channel, long startNanos, boolean success) {
+        onReceiveEnd(recorder(channel), startNanos, success);
+    }
+
+    /** The instance-wide counterpart. */
+    public void onReceiveEnd(long startNanos, boolean success) {
+        onReceiveEnd(nodeRecorder, startNanos, success);
+    }
+
+    private void onReceiveEnd(MetricRecorder r, long startNanos, boolean success) {
         if (!enabled) {
             return;
         }
-        ChannelRecorder r = recorder(channel);
-        int now = r.inflight.decrementAndGet();
-        r.updatePeakInflight(now + 1);
+        int now = r.arriving.decrementAndGet();
+        r.updatePeakArriving(now + 1);
 
         if (success) {
             r.received.increment();
@@ -171,10 +257,90 @@ public class MetricsRegistry {
         }
     }
 
-    /** A duplicate message arrived and was turned away by de-duplication. */
+    // ------------------------------------------------------------------
+    // Instrumentation: handling, the third stage
+    // ------------------------------------------------------------------
+
+    /**
+     * A listener has begun handling a message.
+     *
+     * <p>Concurrency {@code +1}. This is the figure to read as "how much work is in hand
+     * right now", and it is a different quantity from {@code inflight}, which counts
+     * outbound requests awaiting their answer.
+     *
+     * <p>How far "handling" reaches depends on the listener, and that is deliberate.
+     * A listener that does the work in {@code onPayload} has it measured end to end; one
+     * that hands the work to a pool of its own has the <b>handover</b> measured here, and
+     * what happens inside its pool is its own business to report.
+     *
+     * @return the start time in nanoseconds, or 0 when observability is off
+     */
+    public long onHandleStart(String channel) {
+        return onHandleStart(recorder(channel));
+    }
+
+    /** The instance-wide counterpart. */
+    public long onHandleStart() {
+        return onHandleStart(nodeRecorder);
+    }
+
+    private long onHandleStart(MetricRecorder r) {
+        if (!enabled) {
+            return 0L;
+        }
+        r.handling.incrementAndGet();
+        return System.nanoTime();
+    }
+
+    /**
+     * Handling has finished; concurrency {@code -1}.
+     *
+     * @param startNanos whatever {@link #onHandleStart} returned
+     * @param success    whether the handler ran to completion. A failure still counts
+     *                   towards {@code completionRate}: the work was done, the outcome was
+     *                   a failure, and {@code handleErrorRate} is the share of those
+     */
+    public void onHandleEnd(String channel, long startNanos, boolean success) {
+        onHandleEnd(recorder(channel), startNanos, success);
+    }
+
+    /** The instance-wide counterpart. */
+    public void onHandleEnd(long startNanos, boolean success) {
+        onHandleEnd(nodeRecorder, startNanos, success);
+    }
+
+    private void onHandleEnd(MetricRecorder r, long startNanos, boolean success) {
+        if (!enabled) {
+            return;
+        }
+        int now = r.handling.decrementAndGet();
+        r.updatePeakHandling(now + 1);
+
+        if (success) {
+            r.handled.increment();
+        } else {
+            r.handledFailures.increment();
+        }
+        // Unlike a send, a failed handling stays in the distribution: it was real work that
+        // really took that long, and leaving it out would flatter the numbers
+        if (startNanos > 0L) {
+            r.handle.record(System.nanoTime() - startNanos);
+        }
+    }
+
+    /**
+     * A duplicate message arrived and was turned away by de-duplication.
+     */
     public void onDuplicate(String channel) {
         if (enabled) {
             recorder(channel).duplicates.increment();
+        }
+    }
+
+    /** The instance-wide counterpart. */
+    public void onDuplicate() {
+        if (enabled) {
+            nodeRecorder.duplicates.increment();
         }
     }
 
@@ -199,55 +365,103 @@ public class MetricsRegistry {
         return out;
     }
 
-    /** A snapshot of one channel. A channel with no traffic yields an all-zero snapshot rather than null. */
+    /**
+     * A snapshot of one channel. A channel with no traffic yields an all-zero snapshot rather than null.
+     */
     public ChannelMetrics snapshot(String channel) {
         String key = key(channel);
-        ChannelRecorder r = channels.get(key);
-        return r == null ? emptyMetrics(key) : r.snapshot(key);
+        MetricRecorder r = channels.get(key);
+        return r == null ? ChannelMetrics.empty(key) : r.snapshot(key);
     }
 
-    /** Resets every channel to zero. */
+    /**
+     * Resets every channel to zero.
+     */
     public void reset() {
-        channels.values().forEach(ChannelRecorder::reset);
+        channels.values().forEach(MetricRecorder::reset);
+        nodeRecorder.reset();
     }
 
-    private ChannelRecorder recorder(String channel) {
-        return channels.computeIfAbsent(key(channel), k -> new ChannelRecorder());
+    private MetricRecorder recorder(String channel) {
+        return channels.computeIfAbsent(key(channel), k -> new MetricRecorder());
     }
 
+    /**
+     * The key a channel is recorded under.
+     *
+     * <p>The default channel is keyed <b>{@code "default"}</b> rather than the empty string.
+     * An empty string cannot be written in a Prometheus label or a URL path, so every display
+     * layer had to rename it on the way out, and {@code channel("default")} then silently
+     * returned an all-zero record because that was not the key. One name throughout removes
+     * the trap, and {@link GossipListener#getChannel()} returns the same word by default.
+     */
     private static String key(String channel) {
-        return channel == null ? "" : channel;
+        return channel == null || channel.isEmpty() ? DEFAULT_CHANNEL : channel;
     }
 
-    private static ChannelMetrics emptyMetrics(String channel) {
-        return new ChannelMetrics(channel, 0, 0, 0, 0, 0, 0, 0, 0,
-                0d, 0d, 0d, 0d, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY);
+    /** What this instance as a whole has handled, with no channel attribution. */
+    public ChannelMetrics nodeSnapshot() {
+        return nodeRecorder.snapshot(DEFAULT_CHANNEL);
     }
+
 
     // ------------------------------------------------------------------
 
-    /** All the counters for one channel. */
-    private static final class ChannelRecorder {
+    /**
+     * One set of counters. The <b>same</b> class serves both levels: {@link #channels} holds
+     * one per channel, and {@link #nodeRecorder} is the instance-wide one.
+     *
+     * <p>They are fed by separate calls rather than one being summed from the other. The
+     * node's figures therefore include what no channel can account for: control-plane
+     * traffic, a frame that would not decode, a frame from another cluster.
+     */
+    private static final class MetricRecorder {
 
         private final LongAdder sendFailures = new LongAdder();
         private final LongAdder retries = new LongAdder();
         private final LongAdder receiveFailures = new LongAdder();
         private final LongAdder duplicates = new LongAdder();
+        private final LongAdder handledFailures = new LongAdder();
 
-        /** Successful sends and receives use RateCounter, since they need both a total and a TPS. */
+        /**
+         * Successful sends and receives use RateCounter, since they need both a total and a TPS.
+         */
         private final RateCounter sent = new RateCounter();
         private final RateCounter received = new RateCounter();
+        private final RateCounter handled = new RateCounter();
 
+        /** Outbound: sent and awaiting an answer. Not the processing concurrency. */
         private final AtomicInteger inflight = new AtomicInteger();
         private final AtomicInteger peakInflight = new AtomicInteger();
 
+        /** Arrived and not yet accepted. Normally near zero; it climbs when intake stalls. */
+        private final AtomicInteger arriving = new AtomicInteger();
+        private final AtomicInteger peakArriving = new AtomicInteger();
+
+        /** In a listener's hands right now. This is the one to read as "work in hand". */
+        private final AtomicInteger handling = new AtomicInteger();
+        private final AtomicInteger peakHandling = new AtomicInteger();
+
         private final LatencyHistogram outbound = new LatencyHistogram();
         private final LatencyHistogram inbound = new LatencyHistogram();
+        private final LatencyHistogram handle = new LatencyHistogram();
 
         void updatePeakInflight(int observed) {
+            raise(peakInflight, observed);
+        }
+
+        void updatePeakArriving(int observed) {
+            raise(peakArriving, observed);
+        }
+
+        void updatePeakHandling(int observed) {
+            raise(peakHandling, observed);
+        }
+
+        private static void raise(AtomicInteger peak, int observed) {
             int cur;
-            while (observed > (cur = peakInflight.get())) {
-                if (peakInflight.compareAndSet(cur, observed)) {
+            while (observed > (cur = peak.get())) {
+                if (peak.compareAndSet(cur, observed)) {
                     return;
                 }
             }
@@ -262,26 +476,43 @@ public class MetricsRegistry {
                     received.total(),
                     receiveFailures.sum(),
                     duplicates.sum(),
+                    handled.total(),
+                    handledFailures.sum(),
                     inflight.get(),
                     peakInflight.get(),
+                    arriving.get(),
+                    peakArriving.get(),
+                    handling.get(),
+                    peakHandling.get(),
                     sent.ratePerSecond(),
                     received.ratePerSecond(),
+                    handled.ratePerSecond(),
                     sent.peakRatePerSecond(),
                     received.peakRatePerSecond(),
+                    handled.peakRatePerSecond(),
                     outbound.snapshot(),
-                    inbound.snapshot());
+                    inbound.snapshot(),
+                    handle.snapshot());
         }
 
         void reset() {
             sent.reset();
             received.reset();
+            handled.reset();
             sendFailures.reset();
             retries.reset();
             receiveFailures.reset();
+            handledFailures.reset();
             duplicates.reset();
+            // The peak is set to whatever is in hand now rather than to zero: a reset in the
+            // middle of a busy moment would otherwise report a peak lower than the current
+            // value, which reads as impossible
             peakInflight.set(inflight.get());
+            peakArriving.set(arriving.get());
+            peakHandling.set(handling.get());
             outbound.reset();
             inbound.reset();
+            handle.reset();
         }
     }
 }

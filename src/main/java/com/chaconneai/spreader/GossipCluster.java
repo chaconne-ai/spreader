@@ -19,6 +19,7 @@ import com.chaconneai.spreader.event.GossipListener;
 import com.chaconneai.spreader.loadbalance.LoadBalancer;
 import com.chaconneai.spreader.metrics.BufferMetrics;
 import com.chaconneai.spreader.metrics.ChannelMetrics;
+import com.chaconneai.spreader.metrics.NodeMetrics;
 import com.chaconneai.spreader.metrics.SplitBrainStatus;
 
 import java.io.IOException;
@@ -311,6 +312,21 @@ public interface GossipCluster extends AutoCloseable {
      * visible and converges.
      */
     SplitBrainStatus splitBrainStatus();
+
+    /**
+     * Everything worth monitoring about this instance, in one self-contained bundle.
+     *
+     * <p>This and {@link #metrics()} are the two levels on offer: this one per instance,
+     * that one per channel. Fetch this and a dashboard has node identity, the cluster
+     * summary, every channel, every buffer and the split-brain state without piecing
+     * anything together.
+     *
+     * <p>spreader hands out <b>data only</b>; exposing it over HTTP, or feeding it to a
+     * metrics registry, is the caller's business.
+     *
+     * @see NodeMetrics
+     */
+    NodeMetrics nodeMetrics();
 
     /**
      * The fill level of every inbound buffer (RingBuffer): queued, capacity, dropped.

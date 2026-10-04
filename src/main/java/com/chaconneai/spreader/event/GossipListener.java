@@ -16,6 +16,7 @@
 package com.chaconneai.spreader.event;
 
 import com.chaconneai.spreader.Node;
+import com.chaconneai.spreader.metrics.MetricsRegistry;
 
 /**
  * Listener for cluster events. Every method is a default, so override only what you
@@ -130,6 +131,40 @@ public interface GossipListener {
      * @param node the member now serving as leader
      */
     default void onLeaderBack(Node node) {
+    }
+
+    /**
+     * Whether this listener finishes the work somewhere other than in
+     * {@link #onPayload}, and therefore records the handling stage itself.
+     *
+     * <p>{@link BufferedGossipListener} says yes: its {@code onPayload} only queues the
+     * message, so measuring there would time the queueing and call it handling, which is
+     * the very confusion this stage was split out to end.
+     *
+     * <p>A listener that hands the work to a pool of its own and does <b>not</b> record the
+     * stage should leave this false. The handover is then what gets measured, which is at
+     * least true of this layer, and what happens inside that pool is for the component to
+     * report.
+     */
+    default boolean defersHandling() {
+        return false;
+    }
+
+    /**
+     * Which channel this listener belongs to.
+     *
+     * <p>Only an answer to "whose traffic is this" for metrics: a listener registered with
+     * {@code addListener(channel, listener)} is attributed by that channel, and this is the
+     * fallback for one registered without.
+     *
+     * <p>It returns {@code "default"} rather than an empty string. The default channel used
+     * to be keyed on the empty string, which cannot be written in a Prometheus label or a
+     * URL path, so every display layer renamed it on the way out and
+     * {@code metrics.channel("default")} then quietly returned an all-zero record because
+     * that was not the key. One name throughout is simpler and has no trap in it.
+     */
+    default String getChannel() {
+        return MetricsRegistry.DEFAULT_CHANNEL;
     }
 
     /**
